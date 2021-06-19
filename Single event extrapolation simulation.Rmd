@@ -1,0 +1,2455 @@
+---
+title: "Single event extrapolation simulation"
+author: "Jaclyn Beca"
+date: "May 20, 2021"
+---
+
+# Setup and load packages
+
+```{r Setup, include=FALSE}
+rm(list=ls())
+memory.limit(size = 1000000)
+pacman::p_load(plyr, multidplyr, tidyverse, survminer, flexsurv, gems, mstate, Metrics, gridExtra, knitr, doParallel, simhelpers, ggpubr, bigparallelr, greybox)
+options(scipen = 999)
+knitr::opts_chunk$set(echo=FALSE, fig.width=8, fig.height=5, fig.path='Figs/', warning=FALSE, message=FALSE, cache.lazy=FALSE)
+
+```
+
+# Introduction
+
+This code is used to produce the results in the paper "Impact of limited sample size and follow-up on single-event survival extrapolation for health technology assessment: A simulation study"
+Built using R version 4.0.3.
+
+# Methods
+
+## Simulation plan
+
+**Aim** The aim of this study is to assess the performance of standard parametric survival analysis techniques for analysis of time-to-event data from clinical trials under conditions of limited data due to small samples or short follow-up. 
+
+**Data generating mechanism** Data were generated for the event of interest from an exponential survival distribution, characterized by a constant hazard rate, $\lambda$. 
+
+## Approach
+
+Factorial design of the following factors affecting data generating mechanism: 
+a) true parameter value(s) for hazard $\lambda$, 
+b) accrual rate, 
+c) sample size of simulated datasets, ($n_{obs}$), 
+d) degree of censoring (proportion of events, $p_{e}$). 
+
+Four scenarios were used to explore two levels of $\lambda$ and accrual. Within each scenario varied 6 levels of $n_{obs}$ and deciles of $p_{e}$. 
+
+## Global simulation setup 
+The following chunk sets up the sample sizes and file naming, seed and parametric distribution names
+
+```{r Global simulation parameters and vars, include = FALSE}
+# Create number of replications (nsim), sample sizes of each replications
+n_sim <- 5000
+n_obs <- c(30, 60, 90, 120, 250, 500)
+
+# Set scenario number
+scen <- 1
+
+# Set filepath and save parameters
+filepath <- getwd()
+
+# Set seed
+seed <- 20
+set.seed(seed)
+
+# Define new functions
+
+se <- function(x) {sd(x, na.rm = TRUE) * sqrt(1 / n_sim)}
+
+# Set distributions
+
+distribs <- list("exponential", "weibull", "llogis", "lnorm", "gompertz", "gengamma" )
+
+# Output filetype for figures
+
+filetype <- "png"
+
+# Save setup parameters
+
+save(list = ls(), file = paste0(filepath, "/ChapterOne/setup.Rdata"))
+```
+
+## Population simulation setup
+Data for each scenario were simulated from a three-state model: initial state pre-trial entry, intermediate state study enrollment, and final state for the event of interest (e.g., death), using the gems package.
+
+A transition intensity matrix was created with two forward transition intensity functions: 
+$\lambda_{01}:$ Uniform distribution, using time to transition approach to control maximum accrual time.
+$\lambda_{12}:$ Exponential distribution.
+
+The following chunk sets up the number of scenarios, parameters for each population scenario and sets up the matrix.
+
+```{r Initial simulation set up, message=FALSE, include=FALSE}
+fullstart <- Sys.time()
+
+#Set up parameters (population size, patient ID, true rate, max recruitment)
+
+n <- 50000
+id <- data.frame(seq(1, n, 1))
+
+params <- tibble(
+      t1 =     c(365.25 / 12 * 9,  365.25 / 12 * 30, 365.25 / 12 * 9,  365.25 / 12 * 30),
+      f =      c("Exponential", "Exponential", "Exponential", "Exponential"),
+      lambda = c(0.0025, 0.0025, 0.00075, 0.00075))
+# 
+
+scens <- 1:length(params$t1)
+
+# Set up states, transition matrix, transition functions
+
+states <- 3     
+tmat <- transMat(x = list(c(2), c(3), c()),
+                 names = c("Pre-trial","Enrolled","Dead"))   
+
+prepcohort <- function(t1, f, lambda){
+    hf <- generateHazardMatrix(states)                                            
+    hf[[1,2]] <- function() runif(length(n), 1, t1) 
+    hf[[2,3]] <- f
+
+    par <- generateParameterMatrix(hf) 
+    par[[1,2]] <- list()         
+    par[[2,3]] <- list(rate = lambda) 
+
+    ttt <- matrix(FALSE, nrow = 3, ncol = 3)       
+    ttt[1, 2] <- TRUE                                                              
+
+    cohort <- simulateCohort(transitionFunctions = hf, parameters = par,  
+                         cohortSize = n, timeToTransition = ttt, to = 100000)     
+}
+cohort <- mlply(params, prepcohort)
+```
+
+## Cohort data prep
+To simulate the data like a clinical trial dataset, enrollment and death times were rounded to the nearest day, with the former rounded down and latter rounded up to ensure all event times > 0. The data were prepared into long format to analyze each transition separately; the accrual transition was discarded for the analysis of the endpoint of interest.
+
+The following chunk rearranges and prepares the data for analysis
+
+```{r Data prep for full cohort, include=FALSE}
+
+# Create trial dataframe, set times to integers, status = 1 for true cohort
+# Create long dataset and keep only valid 2->3 transitions
+
+ ms_pop_surv <- llply(scens, function(i){
+  data <- as.data.frame(cohort[[i]]@time.to.state)
+  names(data) <- c("pre-trial", "enrolled", "dead")
+  pop_times <- matrix(c(rep(NA,n), 
+                      floor(data$enrolled), ceiling(data$dead)), n, 3)        
+  pop_status <- matrix(c(rep(NA,n), rep(1, n), rep(1,n)), n, 3) 
+  ms_pop <- msprep(time = pop_times, status = pop_status, trans = tmat) 
+  cbind(subset(ms_pop, (trans==2 & time!="Inf" & time!=0)), scenario = i)
+})
+
+slice(ms_pop_surv[[1]], 1:3)
+```
+
+## Population survival analysis
+
+The following chunk analyzes the full population data, plots population survival and saves estimands 
+
+```{r Analysis: Population, warning=FALSE, echo=FALSE}
+
+# Plot KM for population and calculate time horizons
+
+f_pop_km <- function(i) survfit(Surv(time, status) ~ 1, data = ms_pop_surv[[i]])
+pop_km <-f_pop_km(scen)
+horiz <- quantile(pop_km, probs = c(0.99))[[1]]
+f_maxt <- function(i) max(ms_pop_surv[[i]]$time)
+maxt <- f_maxt(scen)
+
+p1 <- ggsurvplot(pop_km, 
+                data = ms_pop_surv[[scen]],
+                xscale = 365.25,
+                break.time.by = 730.5,
+                xlim = c(0,3653),
+                axes.offset = FALSE,
+                legend.title = "",
+                legend.labs = "",
+                legend = "none",
+                surv.median.line = "hv",
+                xlab="Time (years)",
+                font.tickslab = 10,
+                font.x=11,
+                font.y=11,
+                font.title=12,
+                title = c(paste0("Population survival, lambda = ",params$lambda[[scen]])))
+
+ggsave(file = paste0(filepath,"/ChapterOne/figures/popkm", scen, filetype), 
+       print(p1), width = 5, height = 4, units = "in", dpi = 300)
+
+# Extrapolation with exponential for population to generate estimands  
+
+f_exp <- function(i) flexsurvreg(Surv(time, status) ~ 1, data = ms_pop_surv[[i]], dist = "exp")  
+exp <- f_exp(scen)
+
+# List with parameter outputs
+
+pop_exp <- list(scenario = scen,
+       rate = set_names(data.frame(exp$res)[1:3], c("est", "lcl", "ucl")),
+       median = summary(exp, type = "median", tidy = TRUE),
+       oneyear = summary(exp, type = "survival", ci = TRUE, tidy = TRUE, t = 365.25)[2:4],
+       timehorizon = summary(exp, type = "quantile", quantiles=0.99, ci=TRUE, tidy = TRUE)[2:4],
+       rmst = summary(exp, type = "rmst", ci = TRUE, tidy = TRUE, t = horiz)[2:4])
+
+pop_vals <- cbind(category = c("rate", "median", "oneyear", "timehorizon", "rmstsample99", "rmstpop99", "maxt"),
+  Parameter = c("Rate", "Median", "One-year survival", "99% Time horizon", "RMST", "RMST", "max T"),
+  rbind(pop_exp$rate, pop_exp$median, pop_exp$oneyear, pop_exp$timehorizon, pop_exp$rmst, pop_exp$rmst, maxt)) 
+
+horizons <- c("sample99","pop99")
+
+save(list = c("pop_exp", "horizons", "horiz", "maxt"), 
+     file = paste0(filepath, "/ChapterOne/Scenario", scen, "/pop.Rdata"))
+
+write_csv(pop_vals, file = paste0(filepath,"/ChapterOne/tables/popvalues", scen,".csv"))
+
+```
+
+## Repetitions
+
+The following chunk sets up the total number of patients to pull for each repetition and makes random draws for each
+
+
+```{r Selecting samples, include=FALSE}
+
+# Set up total for each repetition
+n_select <- sum(n_obs)
+
+# Create seq for level of n_obs, vector n_sim length for each s_size
+
+s_size <- ldply(1:length(n_obs), function(i){
+  data.frame(rep.int(n_obs[i], n_obs[i]))
+ })                                                                      
+s_size <- rep.int(s_size[,1], n_sim) 
+
+# Pull repetitions, merge with s_size to take each sequential number of rows
+
+set.seed(seed)                    
+cohort_select <- 
+  llply(scens, function(i){
+    cbind(mdply(1:n_sim, function(x){
+      ms_pop_surv[[i]] %>%  
+        slice_sample(n = n_select)
+      }), 
+    s_size) 
+  })    
+
+cohort_select <-llply(scens, function(i){
+  rename(cohort_select[[i]], rep = X1)
+})
+
+# Output example data structure for scenario 1 for appendix 
+
+slice(cohort_select[[1]], 1:6)
+
+rm(cohort)
+
+```
+
+## Sampling methods
+
+From the population, $n_{sim}$ repetitions were randomly sampled from the full population. To analyze the effects of different sizes for $n_{obs} = \{30,  60,  90,  120,  250,  500\}$, each of the $n_{sim}$ repetitions contained $sum(n_{obs}) = $`r n_select` patients and subsetted consecutively to select the appropriate sample size for each sample size level of $n_{obs}$ while ensuring independence across samples.
+
+In clinical trials where the time-to-event outcome is the primary outcome, the interim and final analyses are typically planned at the point of a specific number of events. For each repetition and each sample size, deciles of event times from the start of the study (study time) were estimated and used to create durations of follow-up times according to proportions of events experienced by the sample cohort. This produced a stacked dataset with the individuals in each repetition and sample size repeated with event or censoring times and censoring status from study enrollment for each level of $p_{e} = \{0.1, 0.2, \dots, 1\}$, proportion of events. For patients who have not enrolled by the study censor time corresponding to $p_e$, the patient event time was NA.  
+
+```{r Create censored datasets, include=FALSE}
+
+# For each combo of sim, s_size, and each decile of events (prop_e)
+# Estimate time in days for each decile of events, store each censoring time 
+# Calculate observed times in each decile, from enrollment
+# Set NA if study censor time < accrual time, and set status
+
+### Serial 
+
+# start <- Sys.time()
+# 
+# store <- llply(scen, function(z){
+#   ddply(cohort_select[[z]], .(rep, s_size), function(x){
+#     prop_e <- seq(0.1, 1, 0.1)
+#     mdply(seq_along(prop_e), function(i){ 
+#       t_prop_e <- round(quantile(x$Tstop, probs = prop_e),0)                          
+#       t_c <- t_prop_e[[i]]
+#       t_obs <- pmin(x$Tstop, t_c) 
+#       time2 <- t_obs - x$Tstart
+#       time2 <- ifelse(time2 > 0, time2, NA)                                     
+#       status2 <- ifelse(is.na(time2), NA, ifelse(x$Tstop > t_c, 0,1))
+#       prop_e <- prop_e[[i]]  
+#       data.frame(rbind(
+#              cbind(x, prop_e, t_obs, time2, status2))) 
+#       })
+#    })
+#  })
+# 
+# Sys.time() - start
+
+### Parallel 
+ f_store <- function(scen){
+ store <- ddply(cohort_select[[scen]], .(rep, s_size), function(x){
+    prop_e <- seq(0.1, 1, 0.1)
+    mdply(seq_along(prop_e), function(i){
+      t_prop_e <- round(quantile(x$Tstop, probs = prop_e),0)
+      t_c <- t_prop_e[[i]]
+      t_obs <- pmin(x$Tstop, t_c)
+      time2 <- t_obs - x$Tstart
+      time2 <- ifelse(time2 > 0, time2, NA)
+      status2 <- ifelse(is.na(time2), NA, ifelse(x$Tstop > t_c, 0,1))
+      prop_e <- prop_e[[i]]
+      data.frame(rbind(
+             cbind(x, prop_e, t_obs, time2, status2)))
+      })
+   }, .parallel = TRUE,
+    .paropts=list(.export=c('scen', 'cohort_select'),
+                 .packages=c('tidyverse', 'survival', 'flexsurv')))
+ }
+
+
+start <- Sys.time()
+
+# Registering cores
+
+cores <- detectCores() - 1
+cl <- parallel::makeCluster(cores)
+registerDoParallel(cl)
+
+# Create data
+store <- f_store(scen)
+
+# Close connection
+stopCluster(cl)
+rm(cores)
+rm(cl)
+
+save(store, file = paste0(filepath,"/ChapterOne/Scenario", scen, "/store.Rdata"))
+
+Sys.time() - start
+
+# Output event time deciles example from Scenario 1 rep 1 sample size 30  for appendix on approach
+
+round(quantile(head(cohort_select[[1]], n=30)$Tstop, probs = seq(0.1, 1, 0.1)),0)
+
+# Output data structure example from scenario 1 rep 1 sample size 30 first three levels for appendix on approach
+
+store %>% select(rep, id, from, to, trans, Tstart, Tstop, time, status, s_size, prop_e, t_obs, time2, status2) %>%  slice(1:6)
+store %>% select(rep, id, from, to, trans, Tstart, Tstop, time, status, s_size, prop_e, t_obs, time2, status2) %>%  slice(31:36)
+
+```
+
+**Estimands and population targets** 
+
+The population quantities of interest included the fitted population exponential rate $\lambda_{12}$, median survival time, landmark one year survival probability, 1% survival probability time(time horizons, $T_{2}$), and restricted mean survival time (RMST) at time horizons $T_{2}$. $T_{2,pop}$ was determined from the population's true survival time where 99% of patients have experienced the event. RMST was also estimated at the time horizon, $T_{2,i}$, when the extrapolated survival curves reached 1% for each simulated dataset, representing the approach used in modelling when the true time horizon is unknown. 
+
+The target distribution, assessed by the proportion of repetitions selecting the true survival distribution (exponential) as best fitting, according to statistical goodness-of-fit using AIC, BIC and corrected AIC and BIC.
+
+**Analytic Methods**
+
+The true population and each simulated dataset $i = 1, \dots , n_{sim}$ were analyzed for each size of $n_{obs}$ and each decile of events $p_{e}$, by fitting a parametric survival curve using an exponential distribution. Estimated parametric model parameters were extracted for each target estimand. Other standard parametric distributions (Weibull, log-normal, log-logistic, generalized Gamma and Gompertz) were also  fit and the goodness-of-fit AIC measure extracted so that the proportion of simulations that select the true population distribution could also be estimated.Lastly, for repetitions where the best fitting distribution was not exponential, the model parameters were extracted for each target estimand from the best-fitting distribution.
+
+```{r Analysis: Single replication, eval=FALSE, message=FALSE, warning=FALSE, include=FALSE, results="hide"}
+# 
+# # Plot KM for each level of sample size and proportion of a single replication
+#  
+# sample_one <- llply(scen, function(i){
+#   store[[i]] %>% 
+#     filter(rep == 1) %>% 
+#     select(s_size, prop_e, time2, status2) 
+# })
+# 
+# llply(scen, function(i){
+#   xmax <- max(sample_one[[i]]$time2, na.rm=TRUE) * 0.3
+#   prop <- unique(sample_one[[i]]$prop_e)*100
+#   fit <- survfit(Surv(time2, status2) ~ s_size, data=sample_one[[i]])
+#   ggsurvplot_group_by(fit, sample_one[[i]], group.by ="prop_e", 
+#                     xscale = 365.25,
+#                     break.time.by = 365.25,
+#                     xlim = c(0, xmax),
+#                     axes.offset = FALSE,
+#                     surv.median.line = "h",
+#                     xlab = "Time (years)",
+#                     font.tickslab = 10,
+#                     font.x = 11,
+#                     font.y = 11,
+#                     font.title = 12,
+#                     legend.title = "Sample size",   
+#                     legend.labs = NULL,
+#                     legend = "right",
+#                     risk.table = TRUE,
+#                     risk.table.fontsize = 3,
+#                     risk.table.pos = "in",
+#                     risk.table.title = "",
+#                     title = c(paste0("Scenario ", i, " : Cohort censored after ", prop,"% of events")))
+#  
+#   fit <- survfit(Surv(time2, status2) ~ prop_e, data=sample_one[[i]])
+#   ggsurvplot_group_by(fit, sample_one[[i]], group.by ="s_size",
+#                     xscale = 365.25,
+#                     break.time.by = 365.25,
+#                     xlim = c(0, xmax),
+#                     axes.offset = FALSE,
+#                     surv.median.line = "h",
+#                     xlab = "Time (years)",
+#                     font.tickslab = 10,
+#                     font.x = 11,
+#                     font.y = 11,
+#                     font.title = 12,
+#                     legend.title = "Proportion of events",
+#                     legend.labs = NULL,
+#                     legend = "right",
+#                     risk.table = TRUE,
+#                     risk.table.fontsize = 3,
+#                     risk.table.pos = "in",
+#                     risk.table.title = "",
+#                     title = c(paste0("Scenario ", i,": ", n_obs," patients")))
+# })
+```
+
+**Performance measures**
+In order to assess the performance of the extrapolation under various conditions of the data collection process, the coverage and error for each of the estimands were evaluated across the simulations. Firstly, any failed analyses were recorded as missing values, together with reasons if possible. To describe the cohort, the average proportion of the target sample size accrued at each level of events were calculated. With respect to performance in targetting the population quantities of interest, $x$, which include the fitted hazard rate, median survival, landmark one-year survival probability, and restricted mean survival times (RMST), the following key measures were used: 
+
+Selecting best fitting curve - the proportion of repetitions for which the AIC from a parametric survival model using an exponential distribution is lowest among the fitted distributions $$ Best fitting = Pr(AIC_{exp,i} = min(AIC_{dist,i})), $$
+$$ dist = \{exponential, Weibull,lognormal, loglogistic, generalized Gamma, Gompertz\} $$. 
+The median survival, landmark one-year survival probability, RMST were determined from the best-fitting distribution and coverage and error (MAE, RMSE) calculated against population estimands. 
+
+Coverage - the proportion of repetitions in the simulation whose confidence intervals contain the true population quantity.  $$Coverage = Pr(\hat{x}_{low,i} < x < \hat{x}_{upp,i})$$
+Error:
+
+a) Mean absolute error (MAE) - the degree to which the estimates from each replication, $\hat{x}_i$, differs from the true population fitted quantities, $x$, in absolute terms, for each combination of sample size and follow-up time in the simulation. $$MAE = \frac{1}{n_{sim}}\sum_{n=1}^{n_{sim}}|\hat{x}_i-x|$$
+
+b) Mean absolute percentage error (MAE) - the degree to which the estimates from each replication, $\hat{x}_i$, differs from the true population fitted quantities, $x$, in either direction, as a percentage of the true value, for each combination of sample size and follow-up time in the simulation. $$MAPE = \frac{1}{n_{sim}}\sum_{n=1}^{n_{sim}}\frac{|\hat{x}_i-x|}{x}$$
+
+c) Root mean squared error (RMSE) - the root of the mean squared error between each replication and the true population fitted quantity. $$RMSE = \sqrt{\frac{1}{n_{sim}}\sum_{n=1}^{n_{sim}}(\hat{x}_i-x)^2}$$
+
+d) Probability of 20% error - the proportion of repetitions that produced estimates >20% from true value $$\text{Probability of 20% error} = Pr(\frac{|\hat{x}_i-x|}{x} > 20\%)$$
+
+To assess these measures, the fitted rates, medians, survival probabilities and RMST and their CIs were extracted for each repetition in the simulation. The following chunk conducts rowwise parametric survival analysis for combination of sample size and follow-up, "grouping", for each repetition. The analysis is conducted in parallel for efficiency.
+
+```{r Analysis: Extrapolation of all reps, include=FALSE}
+# Nest data and fit exponential curve rowwise, extract estimators
+
+### Serial version
+
+# start <- Sys.time()
+# nested <- store %>%
+#   nest_by(rep, s_size, prop_e) %>%
+#   rowwise() %>%
+#   mutate(fit = list(flexsurvreg(Surv(data$time2, data$status2) ~ 1, dist = "exponential",  data = data))) %>%
+#   mutate(N = fit$N,
+#          rate = list(set_names(fit$res[1:3], c("est", "lcl", "ucl"))),
+#          median = summary(fit, type = "median"),
+#          timehorizon = summary(fit, type = "quantile", quantiles = 0.99, ci = TRUE),
+#          oneyear = summary(fit, type = "survival", t = 365.25),
+#          rmst = summary(fit, type = "rmst", t = c(times$est, horiz))) %>% select(-fit)
+# Sys.time() - start
+
+### Parallelized version 
+
+start <- Sys.time()
+
+# Registering cores
+cores <- detectCores() - 1
+cluster <- tryCatch(new_cluster(cores), error = function(c) tryCatch(new_cluster(cores), error = function(c) new_cluster(cores)))
+cluster_library(cluster, "flexsurv")
+cluster_copy(cluster, c("horiz"))
+
+# Set up and partition data
+nested_part <- store %>%
+  nest_by(rep, s_size, prop_e) %>%
+  rowwise() %>%
+  partition(cluster) 
+
+nested <- nested_part %>% 
+  mutate(fit = list(flexsurvreg(Surv(time2, status2) ~ 1, dist = "exponential",  data = data))) %>%
+  mutate(N = fit$N,
+         rate = list(fit$res[1:3]),
+         median = summary(fit, type = "median"),
+         timehorizon = summary(fit, type = "quantile", quantiles = 0.99, ci = TRUE),
+         oneyear = summary(fit, type = "survival", t = 365.25),
+         rmst = summary(fit, type = "rmst", t = c(timehorizon$est, horiz))) %>% 
+  select(-fit) %>% 
+  collect()
+
+# Close connection
+rm(nested_part)
+rm(cluster)
+rm(cores)
+Sys.time() - start
+
+# Name rate variables 
+
+nested$rate <- lapply(nested$rate, function(x) c(unlist(x))) 
+nested$rate <- lapply(nested$rate, function(x) setNames(x, c("est","lcl","ucl")))
+rm(store)
+
+```
+
+```{r Chunk 8 Plot estimates from each replication in the simulation scenarios, echo=FALSE}
+# 
+# # Plot estimates from each repetition in the simulation
+# 
+# measure <- as.character(colnames(nested)[6:9])
+#   
+# f_plot_ests <-function(scen, measure){  
+#   llply(measure, function(i){
+#   p1<-nested %>% 
+#   unnest_wider(i) %>% 
+#   ggplot(aes(y = est, 
+#              x = rep, 
+#              group = s_size, 
+#              color = as.factor(s_size))) +
+#         geom_jitter() +
+#         geom_hline(yintercept = pop_exp$i[["est"]], 
+#                    linetype = "dashed") +
+#         labs(title = c(paste0("Scenario ", scen)), 
+#              color = "Sample size", 
+#              x = "Replicate", 
+#              y = i) +
+#         facet_grid(. ~ prop_e, scales = "free")
+#  ggsave(file=paste0(filepath,"/ChapterOne/figures/plotestimate_", i, scen,".pdf"), p1, width =  10, height = 8, units = "in", dpi = 300)
+#   })
+#   }
+# f_plot_ests(scen, measure)
+# 
+# pop_exp$rmst$percent <- c("pop99")
+# 
+# p4 <- nested %>%
+#   unnest(rmst) %>%
+#   mutate(percent = rep(horizons, n_sim*length(n_obs)*10)) %>%
+#   select(est, rep, s_size, prop_e, time, percent) %>%
+#     filter(percent == c("pop99")) %>%
+#   ggplot(aes(y = est, x = rep, group = s_size, color = as.factor(s_size))) +
+#         geom_jitter() +
+#         geom_hline(data = pop_exp$rmst, aes(yintercept = est),
+#                    linetype = "dashed") +
+#         labs(title = c(paste0("Scenario ", scen)),
+#              color = "Sample size",
+#              x = "Replicate",
+#              y = "RMST") +
+#         facet_grid(percent ~ prop_e)
+# ggsave(file=paste0(filepath,"/ChapterOne/figures/plotestimate_rmstpop", scen,".pdf"), p4, width = 10, height = 8, units = "in", dpi = 300)
+# 
+# pop_exp$rmst$percent <- c("sample99")
+# 
+# p5 <- nested %>%
+#   unnest(rmst) %>%
+#   mutate(percent = rep(horizons, n_sim*length(n_obs)*10)) %>%
+#   select(est, rep, s_size, prop_e, time, percent) %>%
+#   filter(percent == c("sample99")) %>%
+#   ggplot(aes(y = est,
+#              x = rep,
+#              group = s_size,
+#              color = as.factor(s_size))) +
+#         geom_jitter() +
+#         geom_hline(data = pop_exp$rmst, aes(yintercept = est),
+#                    linetype = "dashed") +
+#         labs(title = c(paste0("Scenario ", scen)),
+#              color = "Sample size",
+#              x = "Replicate",
+#              y = "RMST") +
+#         facet_grid(percent ~ prop_e)
+# ggsave(file=paste0(filepath,"/ChapterOne/figures/plotestimate_rmstsample", scen,".pdf"), p5, width = 10, height = 8, units = "in", dpi = 300)
+
+```
+
+The MAE, MAPE, RMSE, difference >20% and coverage were assessed for each grouping. 
+The following chunk evaluates each repetition grouping's coverage (CI includes estimand y/n) and error (magnitude of ae, ape, >20% y/n) for each estimand.
+
+```{r Calculate performance measures, include=FALSE}
+
+# Set up population data with RMST estimand captured twice 
+
+pop_exp <- c(pop_exp, rmst2 = list(rbind(pop_exp$rmst, pop_exp$rmst)))
+
+# Calculate coverage and absolute error rowwise and unnest
+
+### Serial 
+start <- Sys.time()
+nested <- nested %>%
+  rowwise() %>%
+  mutate(cover_rate = ifelse((rate[[2]] < pop_exp$rate[["est"]] &
+                            pop_exp$rate[["est"]] < rate[[3]]),1,0),
+         cover_median = ifelse((median[[2]] < pop_exp$median[["est"]] &
+                            pop_exp$median[["est"]] < median[[3]]),1,0),
+         cover_oneyear = ifelse((oneyear$lcl < pop_exp$oneyear[["est"]] &
+                            pop_exp$oneyear[["est"]] < oneyear$ucl),1,0),
+         cover_timehorizon = ifelse((timehorizon$lcl < horiz[["99"]] &
+                            horiz[["99"]] < timehorizon$ucl),1,0),
+         cover_rmst = list(set_names(ifelse(rmst$lcl < pop_exp$rmst2[["est"]] &
+                            pop_exp$rmst2[["est"]] < rmst$ucl,1,0),
+                            c(paste0("cover_rmst", horizons)))),
+         width_rate = rate[[3]] - rate[[2]],
+         width_median = median[[3]] - median[[2]],
+         width_oneyear = oneyear$ucl - oneyear$lcl,
+         width_timehorizon = timehorizon$ucl - timehorizon$lcl,
+         width_rmst = list(set_names(rmst$ucl - rmst$lcl,
+                            c(paste0("width_rmst", horizons)))),
+         e_rate = ae(pop_exp$rate[["est"]], rate[[1]]),
+         e_median = ae(pop_exp$median[["est"]], median[[1]]),
+         e_oneyear = ae(pop_exp$oneyear[["est"]], oneyear[[2]]),
+         e_timehorizon = ae(horiz[["99"]], timehorizon$est),
+         e_rmst = list(set_names(ae(pop_exp$rmst2[["est"]], rmst$est),
+                        c(paste0("e_rmst", horizons)))),
+         rate_est = rate[[1]],
+         median_est = median[[1]],
+         oneyear_est = oneyear$est,
+         timehorizon_est = timehorizon$est,
+         rmst_est = list(set_names(rmst$est,
+                        c(paste0("rmst", horizons)))),
+                  prop_n = N/s_size)
+
+nested <- nested %>% 
+  mutate(pe_rate = ape(pop_exp$rate[["est"]], rate[[1]]),
+         pe_median = ape(pop_exp$median[["est"]], median[[1]]),
+         pe_oneyear = ape(pop_exp$oneyear[["est"]], oneyear[[2]]),
+         pe_timehorizon = ape(horiz[["99"]], timehorizon_est),
+         pe_rmst = list(set_names(ape(pop_exp$rmst2[["est"]], rmst$est),
+                       c(paste0("pe_rmst", horizons)))))
+
+unnested <- nested %>%
+  ungroup() %>%
+  unnest_wider(cover_rmst) %>%
+  unnest_wider(e_rmst) %>%
+  unnest_wider(pe_rmst) %>% 
+  unnest_wider(width_rmst) %>%
+  unnest_wider(rmst_est) %>% 
+  rename(rmstsample99_est = rmstsample99, rmstpop99_est = rmstpop99)
+
+unnested <- unnested %>% 
+  rowwise() %>%
+  mutate(prop20_rate = ifelse(e_rate/pop_exp$rate[["est"]] > 0.2, 1, 0),
+         prop20_median = ifelse(e_median/pop_exp$median[["est"]] > 0.2, 1, 0),
+         prop20_oneyear = ifelse(e_oneyear/pop_exp$oneyear[["est"]] > 0.2, 1, 0),         
+         prop20_timehorizon = ifelse(e_timehorizon/horiz[["99"]] > 0.2, 1, 0), 
+         prop20_rmstsample99 = ifelse(e_rmstsample99/pop_exp$rmst[["est"]] > 0.2, 1, 0),
+         prop20_rmstpop99 = ifelse(e_rmstpop99/pop_exp$rmst[["est"]] > 0.2, 1, 0))    
+
+# unnested <- unnested %>%   
+#   rowwise() %>%
+#   mutate(bias_rate = rate[[1]] - pop_exp$rate[["est"]],
+#          bias_median = median[[1]] - pop_exp$median[["est"]]) %>% 
+#   ungroup()
+
+save(nested, file = paste0(filepath,"/ChapterOne/Scenario", scen, "/nested.Rdata"))
+save(unnested, file = paste0(filepath,"/ChapterOne/Scenario", scen, "/unnested.Rdata"))
+rm(nested)
+
+```
+
+The performance measures are summarized (mean AE, APE, proportion covered, proportion within 20%) along with the monte carlo SE estimates for each. 
+
+```{r summary measures, include=FALSE }
+
+# To work just with data for plots
+# rm(list=ls())
+# filepath <- getwd()
+# load(file = paste0(filepath, "/ChapterOne/setup.Rdata"))
+# load(file = paste0(filepath,"/ChapterOne/Scenario", scen, "/pop.Rdata"))
+# pop_exp <- c(pop_exp, rmst2 = list(rbind(pop_exp$rmst, pop_exp$rmst)))
+# load(file = paste0(filepath,"/ChapterOne/Scenario", scen, "/unnested.Rdata"))
+
+
+# Summarise mean coverage, absolute error, and RMSE for estimators
+
+results <- unnested %>% 
+  group_by(s_size, prop_e) %>% 
+  summarise(
+    prop_n = mean(prop_n),
+    across(starts_with("cover"), mean), 
+    # across(starts_with("bias"), mean),     
+    across(starts_with("width"), list(mean = mean, se = se), .names="{fn}_{col}"), 
+    across(starts_with("e"), list(ma = mean), .names="{fn}{col}"), 
+    across(starts_with("pe"), list(ma = mean), .names="{fn}{col}"),
+    se_mae_rate = se(rate_est),
+    se_mae_median = se(median_est),
+    se_mae_oneyear = se(oneyear_est),
+    se_mae_timehorizon = se(timehorizon_est),
+    se_mae_rmstsample99 = se(rmstsample99_est),
+    se_mae_rmstpop99 = se(rmstpop99_est),
+    se_mape_rate = se(rate_est)/pop_exp$rate[["est"]],
+    se_mape_median = se(median_est)/pop_exp$median[["est"]],
+    se_mape_oneyear = se(oneyear_est)/pop_exp$oneyear[["est"]],
+    se_mape_timehorizon = se(timehorizon_est)/horiz[["99"]],
+    se_mape_rmstsample99 = se(rmstsample99_est)/pop_exp$rmst2[["est"]],
+    se_mape_rmstpop99 = se(rmstpop99_est)/pop_exp$rmst2[["est"]],
+    across(starts_with("prop20"), mean), 
+                    .groups = "keep") %>% 
+  ungroup()
+
+# Create long data for faceted plots 
+results2 <- results %>% 
+    pivot_longer(c(starts_with("mae"), 
+                   starts_with("mape"), 
+                   starts_with("se_mae"),
+                   starts_with("se_mape"),
+                   starts_with("cover"), 
+                   # starts_with("bias"),
+                   starts_with("mean_width"),
+                   starts_with("se_width"),
+                   starts_with("prop20")),
+                 names_to = c(".value", "category"),
+                 names_pattern = "(.+)_(.+)")
+
+# Calculate rmse and its se
+
+pop_exprow <- as.data.frame(pop_exp[-7])
+pop_exprow <- as.data.frame(lapply(pop_exprow, rep, times = length(n_obs)*10*n_sim)) %>% 
+  mutate(rmstsample99.est = rmst.est) %>% 
+  rename(rmstpop99.est = rmst.est)
+  
+meas <- c(colnames(select(unnested, contains("_est"))))
+meas <- str_sub(meas, end=-5)
+
+resultsrmse <- ldply(seq_along(meas),function(i) {
+  unnested %>% 
+    cbind(pop_exprow) %>% 
+    group_by(s_size, prop_e) %>% 
+    do(calc_absolute(., 
+                     estimates = paste0(meas[[i]], "_est"), 
+                     true_param = paste0(meas[[i]], ".est"), 
+                     perfm_criteria = c("rmse")))  %>% 
+    cbind(., param = meas[[i]])
+})
+
+resultsrmse <- resultsrmse %>%
+  pivot_wider(names_from = param, values_from = c(rmse, rmse_mcse))
+
+resultsrmse2 <- resultsrmse %>% 
+  pivot_longer(c(starts_with("rmse"),
+               starts_with("rmse_mcse")),
+               names_to = c(".value", "category"),
+               names_pattern = "(.+)_(.+)")
+
+
+# resultsnewcover <- unnested %>% 
+#     unnest(median) %>% 
+#     cbind(pop_exprow) %>% 
+#     group_by(s_size, prop_e) %>% 
+#     do(calc_coverage(., 
+#                      lower_bound = lcl, 
+#                      upper_bound = ucl, 
+#                      true_param = median.est))
+
+# resultscover <- results2 %>% 
+#   filter(category == "median") %>% 
+#   mutate(se_cover = sqrt(cover * (1 - cover) / n_sim))
+
+
+results2 <- full_join(results2, resultsrmse2)
+
+write_csv(as.data.frame(results2), file = paste0(filepath, "/ChapterOne/tables/results", scen, ".csv"))
+
+rm(resultsrmse)
+rm(resultsrmse2)
+
+```
+
+The performance measures were summarized and plotted to illustrate the impact across sample sizes and degrees of censoring with true distribution correctly specified.
+
+```{r Plot results, echo=FALSE, results="hide"}
+
+## Load data for plotting
+# results2 <- read.csv(file = paste0(filepath, "/ChapterOne/tables/results",scen, ".csv"))
+
+# Plot proportion of sample target accrual by follow-up time decile 
+
+p1 <- ggplot(results, aes(x = prop_e, 
+                         y = prop_n, 
+                         group = s_size, 
+                         color = as.factor(s_size))) +
+        geom_line() +
+        labs(title = c(paste0("Scenario ", scen)), 
+             color = "Sample size", 
+             x = "Proportion of events", 
+             y = "Proportion of target sample accrued") +
+        scale_x_continuous(breaks = seq(0, 1, 0.2)) +
+        ylim(c(0, 1)) +
+        theme_classic()
+ggsave(file = paste0(filepath, "/ChapterOne/figures/plotaccrued", scen, ".", filetype), 
+       p1, width = 6, height = 3, units = "in", dpi = 300)
+
+measures <-as.character(unique(results2$category))
+
+plot <- results2 %>% 
+        filter(category == measures) %>% 
+        ggplot(aes(x = prop_e, 
+                   y = cover, 
+                   group = s_size, 
+                   color = as.factor(s_size))) +
+          geom_line() +
+          geom_errorbar(aes(ymin = (cover - sqrt(cover * (1 - cover) / n_sim)), 
+                            ymax = (cover + sqrt(cover * (1 - cover) / n_sim))), 
+                        width=.01) +
+          scale_x_continuous(breaks = seq(0, 1, 0.2)) +
+          facet_grid(category  ~ ., scales = "fixed") +
+          labs(color = "Sample size", 
+               x = "Proportion of events") +
+          ggtitle(c(paste0("Scenario ", scen,": Coverage"))) +
+          theme_classic() +
+          geom_hline(yintercept = 0.95, color = "grey") +
+          geom_hline(yintercept = 0.955, color = "grey", linetype = "dashed") + 
+          geom_hline(yintercept = 0.945, color = "grey", linetype = "dashed") 
+ggsave(file = paste0(filepath, "/ChapterOne/figures/plot_cover", scen, ".", filetype), 
+       plot, width = 5, height = 7, units = "in", dpi = 300)
+
+# plot <- results2 %>% 
+#         filter(category == measures) %>% 
+#         ggplot(aes(x = prop_e, 
+#                    y = mean_width, 
+#                    group = s_size, 
+#                    color = as.factor(s_size))) +
+#           geom_line() +
+#           geom_errorbar(aes(ymin = (mean_width - se_width),
+#                             ymax = (mean_width + se_width)),
+#                         width=.01) +
+#           scale_x_continuous(breaks = seq(0, 1, 0.2)) +
+#           facet_grid(category  ~ .,  scales = "free") +
+#           labs(color = "Sample size", 
+#                x = "Proportion of events") +
+#           ggtitle(c(paste0("Scenario ", scen,": CI width"))) +
+#           theme_classic()
+# ggsave(file = paste0(filepath, "/ChapterOne/figures/plot_width", scen, ".", filetype), 
+#        plot, width = 5, height = 7, units = "in", dpi = 300)
+
+plot <- results2 %>% 
+        filter(category == measures) %>% 
+        ggplot(aes(x = prop_e, 
+                   y = mae, 
+                   group = s_size, 
+                   color = as.factor(s_size))) +
+          geom_line() +
+          geom_errorbar(aes(ymin = (mae - se_mae),
+                            ymax = (mae + se_mae)),
+                        width=0.01) +
+          scale_x_continuous(breaks = seq(0, 1, 0.2)) +
+          facet_grid(category  ~ .,  scales = "free") +
+          labs(color = "Sample size", 
+               x = "Proportion of events") +
+          ggtitle(c(paste0("Scenario ", scen,": MAE"))) +
+          theme_classic()
+ggsave(file = paste0(filepath,"/ChapterOne/figures/plot_mae", scen, ".", filetype), 
+       plot, width = 7, height = 10, units = "in", dpi = 300) 
+
+plot <- results2 %>% 
+        filter(category == measures) %>% 
+        ggplot(aes(x = prop_e, 
+                   y = mape, 
+                   group = s_size, 
+                   color = as.factor(s_size))) +
+          geom_line() +
+          geom_errorbar(aes(ymin = (mape - se_mape),
+                            ymax = (mape + se_mape)),
+                        width=0.01) +
+          scale_x_continuous(breaks = seq(0, 1, 0.2)) +
+          scale_y_continuous(labels = scales::percent) +
+          facet_grid(category  ~ .,  scales = "fixed") +
+          labs(color = "Sample size", 
+               x = "Proportion of events") +
+          ggtitle(c(paste0("Scenario ", scen, ": MAPE"))) +
+          theme_classic()
+ggsave(file = paste0(filepath, "/ChapterOne/figures/plot_mape", scen, ".", filetype), 
+       plot, width = 7, height = 10, units = "in", dpi = 300) 
+
+plot <- results2 %>% 
+        filter(category == measures) %>% 
+        ggplot(aes(x = prop_e, 
+                   y = rmse, 
+                   group = s_size, 
+                   color = as.factor(s_size))) +
+          geom_line() +
+          geom_errorbar(aes(ymin = (rmse - rmse_mcse),
+                            ymax = (rmse + rmse_mcse)),
+                        width=0.01) +
+          scale_x_continuous(breaks = seq(0, 1, 0.2)) +
+          facet_grid(category  ~ .,  scales = "free") +
+          labs(color = "Sample size", 
+               x = "Proportion of events") +
+          ggtitle(c(paste0("Scenario ", scen,": RMSE"))) +
+          theme_classic()
+ggsave(file = paste0(filepath,"/ChapterOne/figures/plot_rmse", scen, ".", filetype), 
+       plot, width = 7, height = 10, units = "in", dpi = 300)  
+
+p1 <- results2 %>% 
+        filter(category == measures) %>% 
+        ggplot(aes(x = prop_e, 
+                   y = prop20, 
+                   group = s_size, 
+                   color = as.factor(s_size))) +
+        geom_line() +
+        geom_errorbar(aes(ymin = (prop20 - sqrt(prop20 * (1 - prop20) / n_sim)), 
+                          ymax = (prop20 + sqrt(prop20 * (1 - prop20) / n_sim))), 
+                      width=.01) +                      
+        labs(color = "Sample size", 
+               x = "Proportion of events",
+               y = "Proportion of replications with >20% difference from true population") +
+        ggtitle(c(paste0("Scenario ", scen,": Probability of >20% difference"))) +
+        scale_x_continuous(breaks = seq(0, 1, 0.2)) +
+        facet_grid(category  ~ ., scales = "fixed") +
+        ylim(c(0, 1)) +
+        theme_classic()
+ggsave(file = paste0(filepath, "/ChapterOne/figures/plotpropdiff", scen, ".", filetype), 
+       p1, width = 5, height = 7, units = "in", dpi = 300)
+
+plot <- results2 %>% 
+        filter(category == measures) %>% 
+        ggplot(aes(x = prop_e, 
+                   y = mae, 
+                   group = s_size, 
+                   color = as.factor(s_size))) +
+          geom_line() +
+          geom_errorbar(aes(ymin = (mae - se_mae),
+                            ymax = (mae + se_mae)),
+                        width=0.01) +
+          scale_x_continuous(breaks = seq(0, 1, 0.2)) +
+          scale_y_log10() +
+          facet_grid(category  ~ .,  scales = "free") +
+          labs(color = "Sample size", 
+               x = "Proportion of events") +
+          ggtitle(c(paste0("Scenario ", scen,": MAE, y-axis on logarithmic scale"))) +
+          theme_classic()
+ggsave(file = paste0(filepath, "/ChapterOne/figures/plot_mae_log", scen, ".", filetype), 
+       plot, width = 7, height = 10, units = "in", dpi = 300)  
+
+plot <- results2 %>% 
+        filter(category == measures) %>% 
+        ggplot(aes(x = prop_e, 
+                   y = rmse, 
+                   group = s_size, 
+                   color = as.factor(s_size))) +
+          geom_line() +
+          geom_errorbar(aes(ymin = (rmse - rmse_mcse),
+                            ymax = (rmse + rmse_mcse)),
+                        width=0.01) +
+          scale_x_continuous(breaks = seq(0, 1, 0.2)) +
+          scale_y_log10() +
+          facet_grid(category  ~ .,  scales = "free") +
+          labs(color = "Sample size", 
+               x = "Proportion of events") +
+          ggtitle(c(paste0("Scenario ", scen,": RMSE, y-axis on logarithmic scale"))) +
+          theme_classic()
+ggsave(file = paste0(filepath, "/ChapterOne/figures/plot_rmse_log", scen, ".", filetype), 
+       plot, width = 7, height = 10, units = "in", dpi = 300)  
+
+plot <- results2 %>% 
+        filter(category == measures) %>% 
+        ggplot(aes(x = prop_e, 
+                   y = rmse, 
+                   group = s_size, 
+                   color = as.factor(s_size))) +
+          geom_line() +
+          geom_errorbar(aes(ymin = (rmse - rmse_mcse),
+                            ymax = (rmse + rmse_mcse)),
+                        width=0.01) +
+          scale_x_continuous(breaks = seq(0, 1, 0.2)) +
+          scale_y_log10() +
+          facet_grid(category  ~ .,  scales = "free") +
+          labs(color = "Sample size", 
+               x = "Proportion of events") +
+          ggtitle(c(paste0("Scenario ", scen,": RMSE, y-axis on logarithmic scale"))) +
+          theme_classic()
+ggsave(file = paste0(filepath, "/ChapterOne/figures/plot_mae_rmse_log", scen, ".", filetype), 
+       plot, width = 7.5, height = 7.5, units = "in", dpi = 300)  
+
+rm(unnested)
+rm(cohort_select)
+rm(results)
+rm(results2)
+rm(id)
+Sys.time() - fullstart
+
+```
+
+To assess best-fitting curves, six parametric distributions were fit to the data and collecting information criteria (IC) from each grouping for each repetition. This chunk sets up a function in parallel to extract the information, along with data from the fit that would flag the result as implausible ("failure"). To preserve memory, each distribution is conducted separately and data saved and removed before the next distribution is analyzed.
+
+```{r Fit alternate distributions, message=FALSE, warning=FALSE, include=FALSE}
+
+# Clear environment and only load initial data to fit distributions and save outputs
+
+# rm(list=ls())
+# filepath <- getwd()
+# load(file = paste0(filepath, "/ChapterOne/setup.Rdata"))
+# load(file = paste0(filepath,"/ChapterOne/Scenario", scen, "/pop.Rdata"))
+# load(file = paste0(filepath,"/ChapterOne/Scenario", scen, "/store.Rdata"))
+
+
+### Parallel -- one distribution at a time
+
+f_aic <- function(i){
+
+  # Registering cores
+
+  cores <- detectCores() - 1
+  cluster <- tryCatch(new_cluster(cores), error = function(c) tryCatch(new_cluster(cores), error = function(c) new_cluster(cores)))
+  cluster_library(cluster, "flexsurv")
+  cluster_copy(cluster, "maxt")
+  aic_part <- store %>%
+      nest_by(rep, s_size, prop_e) %>%
+      rowwise() %>%
+      partition(cluster)
+
+ aic <- aic_part %>%
+      mutate(fit = list(tryCatch(flexsurvreg(Surv(time2, status2) ~ 1, dist = i, data = data),
+            error = function(e) NA, warning = function(w) NA)),
+            fit_id = i,
+            aic = ifelse(anyNA(fit), NA, fit$AIC),
+            loglik = ifelse(anyNA(fit), NA, fit$loglik),
+            N = ifelse(anyNA(fit), NA, fit$N),
+            npars = ifelse(anyNA(fit), NA, fit$npars),
+            bic = ifelse(anyNA(fit), NA, - 2 * loglik + npars * log(N)),                            
+            aicc = ifelse(anyNA(fit), NA, - 2 * loglik + npars * 2 * N / (N - npars - 1)),         
+            bicc = ifelse(anyNA(fit), NA, - 2 * loglik + npars * log(N) * N / (N - npars - 1)),
+            median = ifelse(anyNA(fit), NA, summary(fit, type = "median")),
+            sfit = ifelse(anyNA(fit), NA, list(summary(fit)[[1]][1,]))) %>% 
+     mutate(flag = ifelse(anyNA(fit), NA, ifelse((sfit$ucl - sfit$lcl) > 0.80, TRUE, FALSE)),
+            flag2 = ifelse(anyNA(fit), NA, any(abs(diff(c(1, sfit$est))) < 1e-06)),
+            flag3 = ifelse(anyNA(fit), NA, ifelse(median$est > maxt, TRUE, FALSE))) %>%
+  select(-c(fit)) %>%
+     collect()
+save(aic, file = paste0(filepath,"/ChapterOne/Scenario", scen, "/aicc", i, ".Rdata"))
+rm(aic)
+
+
+# Close connection
+
+rm(aic_part)
+rm(cluster)
+rm(cores)
+}
+
+start <- Sys.time()
+
+lapply(distribs[[1]], f_aic)
+lapply(distribs[[2]], f_aic)
+lapply(distribs[[3]], f_aic)
+lapply(distribs[[4]], f_aic)
+lapply(distribs[[5]], f_aic)
+lapply(distribs[[6]], f_aic)
+Sys.time() - start
+
+
+#             loglik = ifelse(anyNA(fit), NA, fit$loglik),
+#             N = ifelse(anyNA(fit), NA, fit$N),
+#             npars = ifelse(anyNA(fit), NA, fit$npars),
+#             k = ifelse(anyNA(fit), NA, length(fit$coefficients)),
+#             n = ifelse(anyNA(fit), NA, sum(fit$data$m["(weights)"])),
+#             aic = ifelse(anyNA(fit), NA, fit$AIC),
+#             bic = ifelse(anyNA(fit), NA, npars * log(N) - 2 * loglik),
+#             aicc = ifelse(anyNA(fit), NA, aic + ((2 * npars) * (npars + 1) / (N - npars - 1))),
+#             aicc = ifelse(anyNA(fit), NA, aic + ((2 * k) * (k + 1) / (n - k - 1))),
+#             aicc = ifelse(anyNA(fit), NA, - 2 * loglik + ((2 * k) * (n) / (n - k - 1))),
+#             bic = ifelse(anyNA(fit), NA, - 2 * loglik + (k * log(n))),
+#             bicglance = ifelse(anyNA(fit), NA, glance(fit)$BIC),
+#             aicglance = ifelse(anyNA(fit), NA, glance(fit)$AIC),
+#             aiccpackage = ifelse(anyNA(fit), NA, AICc(survreg(Surv(time2, status2) ~ 1, dist = "exponential", data = data), return.K = FALSE, second.ord = TRUE)),
+#             aiccpackage = ifelse(anyNA(fit), NA, greybox::AICc(fit)),
+#             biccpackage = ifelse(anyNA(fit), NA, greybox::BICc(fit)),
+
+## AICc formula -2 * ll + 2 * k * (n / (n - k - 1)) OR aic + ((2*k)*(k+1)/(n-k-1))
+### Results: aicc, aicc2, aicc3 produced same results, but aiccpackage and aiccpackage2 produced different
+### AIC and AICglance produced the same as well, and BIC, BIC2 and BICglance
+
+```
+
+The resulting data from each fit is loaded into the workspace and combined.
+
+```{r Retrieve and combine datasets, include=FALSE}
+
+rm(store)
+
+aic_data <- lapply(seq_along(distribs), function(i) {
+       get(load(paste0(filepath,"/ChapterOne/Scenario", scen, "/aicc", distribs[[i]], ".Rdata")))
+})
+
+aic_data <- dplyr::bind_rows(aic_data)
+
+aic_data <- aic_data %>% 
+  # mutate(fit_id = rep(distribs,each = 300000)) %>% 
+  rowwise() %>% 
+  mutate(width_median = ifelse(anyNA(median), NA, median[[3]] - median[[2]])) %>% 
+  mutate(flag4 = ifelse(anyNA(median), NA, ifelse((median$ucl - median$lcl) > maxt, TRUE, FALSE))) %>% 
+  mutate(flag5 = ifelse(anyNA(median), NA, ifelse(width_median > maxt, TRUE, FALSE)))
+
+# aic_weight <- aic_data %>% 
+#   filter(flag == FALSE & flag2 == FALSE & flag3 == FALSE & flag4 == FALSE) %>% 
+#   rowwise() %>% 
+#   mutate(median = list(na_if(median, "Inf")),
+#          e_median = ae(pop_exp$median[["est"]], median[[1]])) %>% 
+#   group_by(rep, s_size, prop_e) %>% 
+#   summarize(medianweighted = weighted.mean(e_median, 1/aic, .groups = "keep"))
+
+```
+
+Failures are summarized and from the remaining options, the best fitting distribution is identified from the lowest IC value for each grouping for each repetition for each IC type.
+
+```{r Calculate summary failures and identify distribution with lowest IC, message=FALSE, warning=FALSE, include=FALSE}
+
+# Collect failures
+n_fail <- cbind(models = length(n_obs) * n_sim * 10 * length(distribs),
+        noconverge = nrow(aic_data %>% filter(is.na(aic))),
+        nosdiff =  nrow(aic_data %>% filter(flag2 == TRUE)),
+        wideconf = nrow(aic_data %>% filter(flag == TRUE)),
+        longmed = nrow(aic_data %>% filter(flag3 == TRUE)),
+        widemed = nrow(aic_data %>% filter(flag4 == TRUE)),
+        none =  nrow(aic_data %>% filter(flag == FALSE & flag2 == FALSE & flag3 == FALSE & flag4 == FALSE)),
+        bestmodels = length(n_obs) * n_sim * 10)
+
+# Report failures by sample size/ followup
+fails_dist <- aic_data %>% 
+  mutate(none = (flag == FALSE & flag2 == FALSE & flag3 == FALSE & flag4 == FALSE)) %>% 
+ group_by(s_size, prop_e, fit_id) %>%
+  summarize(noconverge = sum(is.na(aic)),
+            nosdiff =  sum(flag2, na.rm = TRUE),
+            wideconf = sum(flag, na.rm = TRUE),
+        longmed = sum(flag3, na.rm = TRUE),
+        widemed = sum(flag4, na.rm = TRUE),
+        none =  sum(none, na.rm = TRUE),
+        .groups = "keep")
+write_csv(as.data.frame(fails_dist), file = paste0(filepath,"/ChapterOne/tables/failsdist", scen, ".csv"))
+
+fails <- aic_data %>% 
+  mutate(none = (flag == FALSE & flag2 == FALSE & flag3 == FALSE & flag4 == FALSE)) %>% 
+ group_by(s_size, prop_e) %>%
+  summarize(noconverge = sum(is.na(aic)),
+            nosdiff =  sum(flag2, na.rm = TRUE),
+            wideconf = sum(flag, na.rm = TRUE),
+        longmed = sum(flag3, na.rm = TRUE),
+        widemed = sum(flag4, na.rm = TRUE),
+        none =  sum(none, na.rm = TRUE),
+        .groups = "keep")
+
+aic_data <- aic_data %>% 
+  arrange(rep, s_size, prop_e)
+
+# Identify distribution with lowest IC
+
+bestfit_aic <- aic_data %>% 
+  filter(flag == FALSE & flag2 == FALSE & flag3 == FALSE & flag4 == FALSE) %>% 
+  group_by(rep, s_size, prop_e) %>% 
+  filter(aic == min(as.double(aic), na.rm = TRUE))
+bestfit_bic <- aic_data %>%
+  filter(flag == FALSE & flag2 == FALSE & flag3 == FALSE & flag4 == FALSE) %>%
+  group_by(rep, s_size, prop_e) %>%
+  filter(bic == min(as.double(bic), na.rm = TRUE))
+bestfit_aicc <- aic_data %>% 
+  filter(flag == FALSE & flag2 == FALSE & flag3 == FALSE & flag4 == FALSE) %>% 
+  group_by(rep, s_size, prop_e) %>% 
+  filter(aicc == min(as.double(aicc), na.rm = TRUE))
+bestfit_bicc <- aic_data %>% 
+  filter(flag == FALSE & flag2 == FALSE & flag3 == FALSE & flag4 == FALSE) %>% 
+  group_by(rep, s_size, prop_e) %>% 
+  filter(bicc == min(as.double(bicc), na.rm = TRUE))
+
+saveRDS(bestfit_aic, file = paste0(filepath,"/ChapterOne/Scenario", scen, "/bestfit_aic.RDS"))
+saveRDS(bestfit_aicc, file = paste0(filepath,"/ChapterOne/Scenario", scen, "/bestfit_aicc.RDS"))
+saveRDS(bestfit_bic, file = paste0(filepath,"/ChapterOne/Scenario", scen, "/bestfit_bic.RDS"))
+saveRDS(bestfit_bicc, file = paste0(filepath,"/ChapterOne/Scenario", scen, "/bestfit_bicc.RDS"))
+
+# Summarize proportion with exponential as lowest IC
+
+summary_aic <- bestfit_aic %>% 
+  ungroup() %>% 
+  group_by(s_size, prop_e) %>% 
+  filter(fit_id == "exponential") %>% 
+  summarise(prop_exp = n()/n_sim, .groups = "keep")
+summary_aicc <- bestfit_aicc %>% 
+  ungroup() %>% 
+  group_by(s_size, prop_e) %>% 
+  filter(fit_id == "exponential") %>% 
+  summarise(prop_exp = n()/n_sim, .groups = "keep")
+summary_bic <- bestfit_bic %>%
+   ungroup() %>%
+   group_by(s_size, prop_e) %>%
+   filter(fit_id == "exponential") %>%
+   summarise(prop_exp = n()/n_sim, .groups = "keep")
+summary_bicc <- bestfit_bicc %>%
+   ungroup() %>%
+   group_by(s_size, prop_e) %>%
+   filter(fit_id == "exponential") %>%
+   summarise(prop_exp = n()/n_sim, .groups = "keep")
+
+write_csv(as.data.frame(summary_aic), file = paste0(filepath, "/ChapterOne/tables/summary_aic", scen, ".csv"))
+write_csv(as.data.frame(summary_bic), file = paste0(filepath, "/ChapterOne/tables/summary_bic", scen, ".csv"))
+write_csv(as.data.frame(summary_aicc), file = paste0(filepath, "/ChapterOne/tables/summary_aicc", scen, ".csv"))
+write_csv(as.data.frame(summary_bicc), file = paste0(filepath, "/ChapterOne/tables/summary_bicc", scen, ".csv"))
+
+# summary_ic
+rm(aic_data)
+```
+
+The next chunk produces plots of failures and proportion best-fitting across groupings and across IC types.
+
+```{r plot proportion of reps with exp as lowest AIC or BIC, echo=FALSE, results="hide"}
+
+# summary_aic <- read.csv(file = paste0(filepath, "/ChapterOne/tables/summary_aic",scen, ".csv"))
+# summary_bic <- read.csv(file = paste0(filepath, "/ChapterOne/tables/summary_bic",scen, ".csv"))
+
+# Plots
+plot <- ggplot(fails, aes(x = prop_e,
+                                y = 1 - none /(n_sim *  length(distribs)),
+                                group = s_size,
+                                color = as.factor(s_size))) +
+               geom_line() +
+               labs(title = paste0("Scenario ", scen),
+                    color = "Sample size",
+                    x = "Proportion of events",
+                    y = "Proportion failed") +
+               scale_x_continuous(breaks=seq(0, 1, 0.2)) +
+               ylim(0, 1) +
+               theme_classic()
+ggsave(file = paste0(filepath, "/ChapterOne/figures/plot_fails", scen, ".", filetype), 
+       plot, width = 6, height = 4, units = "in", dpi = 300)
+
+write_csv(as.data.frame(fails), file = paste0(filepath,"/ChapterOne/tables/failsgroups", scen, ".csv"))
+
+# Plot the proportion with best-fit as exponential
+plot <- ggplot(summary_aic, aes(x = prop_e,
+                                y = prop_exp,
+                                group = s_size,
+                                color = as.factor(s_size))) +
+               geom_line() +
+               labs(title = paste0("Scenario ", scen),
+                    color = "Sample size",
+                    x = "Proportion of events",
+                    y = "Proportion exponential as best fit by AIC") +
+               scale_x_continuous(breaks=seq(0, 1, 0.2)) +
+               ylim(0, 1) +
+               theme_classic()
+ggsave(file = paste0(filepath, "/ChapterOne/figures/plot_proportion_expaic", scen, ".", filetype),
+       plot, width = 5, height = 4, units = "in", dpi = 300)
+
+plot <- ggplot(summary_aicc, aes(x = prop_e,
+                                y = prop_exp,
+                                group = s_size,
+                                color = as.factor(s_size))) +
+               geom_line() +
+               labs(title = paste0("Scenario ", scen),
+                    color = "Sample size",
+                    x = "Proportion of events",
+                    y = "Proportion exponential as best fit by AICc") +
+               scale_x_continuous(breaks=seq(0, 1, 0.2)) +
+               ylim(0, 1) +
+               theme_classic()
+ggsave(file = paste0(filepath, "/ChapterOne/figures/plot_proportion_expaicc", scen, ".", filetype), 
+       plot, width = 5, height = 4, units = "in", dpi = 300)
+
+plot <- ggplot(summary_bic, aes(x = prop_e,
+                                y = prop_exp,
+                                group = s_size,
+                                color = as.factor(s_size))) +
+              geom_line() +
+              labs(title = paste0("Scenario ", scen),
+                   color = "Sample size",
+                   x = "Proportion of events",
+                   y = "Proportion exponential as best fit by BIC") +
+              scale_x_continuous(breaks = seq(0, 1, 0.2)) +
+              ylim(0, 1) +
+              theme_classic()
+ggsave(file = paste0(filepath, "/ChapterOne/figures/plot_proportion_expbic", scen, ".", filetype), 
+       plot, width = 5, height = 4, units = "in", dpi = 300)
+
+plot <- ggplot(summary_bicc, aes(x = prop_e,
+                                y = prop_exp,
+                                group = s_size,
+                                color = as.factor(s_size))) +
+              geom_line() +
+              labs(title = paste0("Scenario ", scen),
+                   color = "Sample size",
+                   x = "Proportion of events",
+                   y = "Proportion exponential as best fit by BICc") +
+              scale_x_continuous(breaks = seq(0, 1, 0.2)) +
+              ylim(0, 1) +
+              theme_classic()
+ggsave(file = paste0(filepath, "/ChapterOne/figures/plot_proportion_expbicc", scen, ".", filetype), 
+       plot, width = 5, height = 4, units = "in", dpi = 300)
+```
+
+The following chunk repeats the analysis collecting fitted medians, survival probabilities and RMST and their CIs for each repetition in the simulation from the best-fitting curve according to the specified IC. The following chunk conducts rowwise parametric survival analysis for each grouping, for each repetition, among those where best-fitting distribution was not exponential. The analysis is conducted in parallel for efficiency.
+
+```{r Using best fitting distribution by IC, echo=FALSE, message=FALSE, warning=FALSE}
+
+# Only calculate for those whose best-fitting is not exponential
+
+# Load population data from initial analysis
+load(file = paste0(filepath,"/ChapterOne/Scenario", scen, "/pop.Rdata"))
+
+# Set up population data with RMST estimand captured twice 
+pop_exp <- c(pop_exp, rmst2 = list(rbind(pop_exp$rmst, pop_exp$rmst)))
+
+### Parallel
+start <- Sys.time()
+
+# Set up analysis type
+
+ictype <- "BICc"
+
+bestfitfile <- readRDS(file = paste0(filepath,"/ChapterOne/Scenario", scen, "/bestfit_", ictype, ".RDS")) 
+
+# Registering cores
+cores <- detectCores() - 1
+cluster <- tryCatch(new_cluster(cores), error = function(c) tryCatch(new_cluster(cores), error = function(c) new_cluster(cores)))
+cluster_library(cluster, c("flexsurv", "dplyr"))
+cluster_copy(cluster, c("horiz", "maxt"))
+
+# Set up and partition file
+bestfit_part <-  bestfitfile %>%
+  filter(fit_id != "exponential") %>%
+  rowwise() %>%
+  partition(cluster) 
+
+# Calculate measures
+bestfit_other <- bestfit_part %>% 
+  mutate(fit = list(flexsurvreg(Surv(time2, status2) ~ 1, dist = fit_id, data = data))) %>%  
+  mutate(timehorizon = summary(fit, type = "quantile", quantiles = 0.99, ci = TRUE),
+         timehorizon_est = case_when(timehorizon$est == "Inf" ~ maxt,
+                               timehorizon$est > maxt ~ maxt,
+                               TRUE ~ timehorizon$est),
+         oneyear = summary(fit, type = "survival", t = 365.25),
+         rmst = tryCatch(summary(fit, type = "rmst", t = c(timehorizon_est, horiz)), error = function(e) NA)) %>% 
+  select(-fit) %>% 
+  collect()
+
+# Close connection
+rm(bestfit_part)
+rm(cluster)
+
+Sys.time() - start
+# load(paste0(filepath,"/ChapterOne/Scenario", scen, "/bestfit_other.Rdata"))
+# bestfit_other <- bestfit_other %>% rename(timehorizon = times, timehorizon_est = times_est, oneyear = landmark)
+
+save(bestfit_other, file = paste0(filepath,"/ChapterOne/Scenario", scen, "/bestfit_other", ictype, ".Rdata"))
+
+```
+
+The following chunk evaluates each repetition grouping's coverage (CI includes estimand y/n) and error (magnitude of ae, ape, >20% y/n) for each estimand.
+
+```{r Calculate performance measures by IC, echo=FALSE}
+
+# load(file = paste0(filepath,"/ChapterOne/Scenario", scen, "/bestfit_other", ictype, ".Rdata"))
+
+# Calculate coverage and absolute error rowwise and unnest
+
+bestfit_other <- bestfit_other %>% 
+  rowwise() %>% 
+  mutate(median = list(na_if(median, "Inf")),
+         oneyear = list(na_if(oneyear, "Inf")),
+         timehorizon = list(na_if(timehorizon, "Inf")),
+         rmst = list(na_if(rmst, "Inf")),
+         cover_median = ifelse((median[[2]] < pop_exp$median[["est"]] &
+                            pop_exp$median[["est"]] < median[[3]]),1,0),
+         cover_oneyear = ifelse((oneyear$lcl < pop_exp$oneyear[["est"]] &
+                            pop_exp$oneyear[["est"]] < oneyear$ucl),1,0),
+         cover_timehorizon = ifelse((timehorizon$lcl < horiz[["99"]] &
+                            horiz[["99"]] < timehorizon$ucl),1,0),         
+         cover_rmst = list(set_names(ifelse(rmst$lcl < pop_exp$rmst2[["est"]] &
+                            pop_exp$rmst2[["est"]] < rmst$ucl,1,0),
+                            c(paste0("cover_rmst", horizons)))),
+         # width_median = median[[3]] - median[[2]],
+         width_oneyear = oneyear$ucl - oneyear$lcl,
+         width_timehorizon = timehorizon$ucl - timehorizon$lcl,         
+         width_rmst = list(set_names(rmst$ucl - rmst$lcl,
+                           c(paste0("width_rmst", horizons)))),
+         e_median = ae(pop_exp$median[["est"]], median[[1]]),
+         e_oneyear = ae(pop_exp$oneyear[["est"]], oneyear[[2]]),
+         e_timehorizon = ae(horiz[["99"]], timehorizon_est),
+         e_rmst = list(set_names(ae(pop_exp$rmst2[["est"]], rmst$est),
+                       c(paste0("e_rmst", horizons)))),
+         pe_median = ape(pop_exp$median[["est"]], median[[1]]),
+         pe_oneyear = ape(pop_exp$oneyear[["est"]], oneyear[[2]]),
+         pe_timehorizon = ape(horiz[["99"]], timehorizon_est),
+         pe_rmst = list(set_names(ape(pop_exp$rmst2[["est"]], rmst$est),
+                       c(paste0("pe_rmst", horizons)))),
+         median_est = median[[1]],
+         oneyear_est = oneyear$est,
+         rmst_est = list(set_names(rmst$est,
+                        c(paste0("rmst", horizons)))),
+                  prop_n = N/s_size)
+
+unnested_other <- bestfit_other %>%  
+  ungroup() %>% 
+  unnest_wider(cover_rmst) %>% 
+  unnest_wider(e_rmst) %>% 
+  unnest_wider(pe_rmst) %>% 
+  unnest_wider(width_rmst) %>% 
+  unnest_wider(rmst_est) %>% 
+  rename(rmstsample99_est = rmstsample99, rmstpop99_est = rmstpop99)
+
+unnested_other <- unnested_other %>% 
+  rowwise() %>%
+  mutate(prop20_median = ifelse(e_median/pop_exp$median[["est"]] > 0.2, 1, 0),
+         prop20_oneyear = ifelse(e_oneyear/pop_exp$oneyear[["est"]] > 0.2, 1, 0),         
+         prop20_timehorizon = ifelse(e_timehorizon/horiz[["99"]] > 0.2, 1, 0), 
+         prop20_rmstsample99 = ifelse(e_rmstsample99/pop_exp$rmst[["est"]] > 0.2, 1, 0),
+         prop20_rmstpop99 = ifelse(e_rmstpop99/pop_exp$rmst[["est"]] > 0.2, 1, 0))    
+
+# Report failures
+
+nna <- nrow(bestfit_other[rowSums(is.na(bestfit_other)) > 0, ])
+
+# nfail <- cbind(scenario = scen,
+#                n_fail,
+#                na = nna)
+# write_csv(as.data.frame(nfail), file = paste0(filepath,"/ChapterOne/tables/fails", scen,".csv"))
+
+rm(bestfit_other)
+```
+
+The following chunk loads the exponential data to merge data from the best fitting exponential and best fitting other. The performance measures are summarized (mean AE, APE, proportion covered, proportion within 20%) along with the monte carlo SE estimates for each. 
+
+```{r Merge best-fitting exp and calculate summary measures by IC, echo=FALSE}
+
+# Bring in the original values where the best fitting curve is exponential
+
+load(file = paste0(filepath,"/ChapterOne/Scenario", scen, "/unnested.Rdata"))
+
+unnested <- unnested %>% 
+  select(-contains("rate")) 
+
+unnested_exp <- bestfitfile %>% 
+  select(-contains("median")) %>%
+  filter(fit_id == "exponential") %>% 
+  left_join(unnested, by = c("rep", "s_size", "prop_e", "data", "N")) %>% 
+  ungroup() 
+
+# rm(unnested)
+# rm(bestfit_aicc)
+
+# Join the exp and other datasets 
+
+unnested_exp <- unnested_exp %>% 
+  rowwise() %>%  
+  mutate(median = list(median),
+         timehorizon = list(timehorizon),
+         oneyear = list(oneyear),
+         rmst = list(rmst))
+# unnested_other$fit_id <- as.character(unnested_other$fit_id)
+
+unnested_best <- full_join(unnested_exp, unnested_other) %>% 
+    arrange(rep, s_size, prop_e) 
+
+# Summarise mean coverage, absolute error, and RMSE for estimators
+
+results_best <- unnested_best %>% 
+  group_by(s_size, prop_e) %>% 
+  summarise(
+     prop_n = mean(prop_n),
+     across(starts_with("cover"), mean, na.rm = TRUE), 
+     across(starts_with("width"), list(mean = ~mean(.x, , na.rm = TRUE), se = se), .names="{fn}_{col}"),
+     across(starts_with("e"), list(ma = ~mean(.x, na.rm = TRUE)), .names="{fn}{col}"),
+     across(starts_with("pe"), list(ma = ~mean(.x, na.rm = TRUE)), .names="{fn}{col}"),
+     se_mae_median = se(median_est),
+     se_mae_oneyear = se(oneyear_est),
+     se_mae_timehorizon = se(timehorizon_est),
+     se_mae_rmstsample99 = se(rmstsample99_est),
+     se_mae_rmstpop99 = se(rmstpop99_est),
+     se_mape_median = se(median_est)/pop_exp$median[["est"]],
+     se_mape_oneyear = se(oneyear_est)/pop_exp$oneyear[["est"]],
+     se_mape_timehorizon = se(timehorizon_est)/horiz[["99"]],
+     se_mape_rmstsample99 = se(rmstsample99_est)/pop_exp$rmst2[["est"]],
+     se_mape_rmstpop99 = se(rmstpop99_est)/pop_exp$rmst2[["est"]],
+     across(starts_with("prop20"), mean), 
+                .groups = "keep") %>% 
+  ungroup() 
+
+# Create long data for faceted plots 
+results2_best <- results_best %>% 
+    pivot_longer(c(starts_with("mae"), 
+                   starts_with("mape"), 
+                   starts_with("se_mae"),
+                   starts_with("se_mape"),
+                   starts_with("cover"), 
+                   starts_with("mean_width"),
+                   starts_with("se_width"),
+                   starts_with("prop20")),
+                 names_to = c(".value", "category"),
+                 names_pattern = "(.+)_(.+)") 
+
+
+# Calculate rmse and its se
+
+pop_exprow <- as.data.frame(pop_exp[-7])
+pop_exprow <- as.data.frame(lapply(pop_exprow, rep, times = length(n_obs)*10*n_sim)) %>% 
+  mutate(rmstsample99.est = rmst.est) %>% 
+  rename(rmstpop99.est = rmst.est)
+  
+meas <- c(colnames(select(unnested_best, contains("_est"))))
+meas <- str_sub(meas, end=-5)
+
+resultsnew_best <- ldply(meas,function(i) {
+  unnested_best %>% 
+    cbind(pop_exprow) %>% 
+    group_by(s_size, prop_e) %>% 
+    do(calc_absolute(., 
+                     estimates = paste0(i, "_est"), 
+                     true_param = paste0(i, ".est"), 
+                     perfm_criteria = c("rmse"))) %>% 
+    cbind(., param = i)
+})
+
+# resultsnew_best <- unnested_best %>% 
+#     cbind(pop_exprow) %>% 
+#     group_by(s_size, prop_e) %>% 
+#     do(calc_absolute(., 
+#                      estimates = median_est, 
+#                      true_param = median.est, 
+#                      perfm_criteria = c("rmse"))) %>% 
+#   cbind(., param = "median") %>% 
+#    rbind(., resultsnew_best)
+
+resultsnew_best <- resultsnew_best %>%
+  pivot_wider(names_from = param, values_from = c(rmse, rmse_mcse, K))
+
+resultsnew2_best <- resultsnew_best %>% 
+  pivot_longer(c(starts_with("rmse"),
+               starts_with("rmse_mcse")),
+               names_to = c(".value", "category"),
+               names_pattern = "(.+)_(.+)")
+
+results2_best <- full_join(results2_best, resultsnew2_best)
+
+write_csv(as.data.frame(results2_best), file = paste0(filepath, "/ChapterOne/tables/results_best", ictype, scen, ".csv"))
+
+
+```
+
+The performance measures were summarized and plotted to illustrate the impact across sample sizes and degrees of censoring with true distribution correctly specified.
+
+```{r Plot results by IC type, echo=FALSE, results="hide"}
+
+# Read in data if just plotting
+# results2_best <- read.csv(file = paste0(filepath, "/ChapterOne/tables/results_best", ictype, scen, ".csv"))
+measures <-as.character(unique(results2_best$category))
+labels <- c(median = "Median", 
+            oneyear = "One-year survival", 
+            timehorizon = "Sample time horizon",             
+            rmstpop99 = "Population time horizon RMST",
+            rmstsample99 = "Sample time horizon RMST")
+
+plot <- results2_best %>% 
+        filter(category == measures) %>% 
+        ggplot(aes(x = prop_e, 
+                   y = cover, 
+                   group = s_size, 
+                   color = as.factor(s_size))) +
+          geom_line() +
+          geom_errorbar(aes(ymin = (cover - sqrt(cover * (1 - cover) / n_sim)), 
+                            ymax = (cover + sqrt(cover * (1 - cover) / n_sim))), 
+                        width = .01) +
+          scale_x_continuous(breaks = seq(0, 1, 0.2)) +
+          facet_grid(category  ~ ., scales = "fixed", labeller = labeller (category = labels)) +
+          labs(color = "Sample size", 
+               x = "Proportion of events") +
+          ggtitle(c(paste0("Scenario ", scen,": Coverage, best-fitting by ", ictype))) +
+          theme_classic() +
+          geom_hline(yintercept = 0.95, color = "grey") +
+          geom_hline(yintercept = 0.955, color = "grey", linetype = "dashed") + 
+          geom_hline(yintercept = 0.945, color = "grey", linetype = "dashed") 
+ggsave(file = paste0(filepath, "/ChapterOne/figures/plot_cover_best", ictype, scen, ".", filetype), 
+       plot, width = 7, height = 10, units = "in", dpi = 300)
+
+# plot <- results2_best %>%
+#         filter(category == measures) %>%
+#         ggplot(aes(x = prop_e,
+#                    y = mean_width,
+#                    group = s_size,
+#                    color = as.factor(s_size))) +
+#           geom_line() +
+#           geom_errorbar(aes(ymin = (mean_width - se_width),
+#                             ymax = (mean_width + se_width)),
+#                         width = .01) +  
+#           scale_x_continuous(breaks = seq(0, 1, 0.2)) +
+#           facet_grid(category  ~ .,  scales = "free") +
+#           labs(color = "Sample size",
+#                x = "Proportion of events") +
+#           ggtitle(c(paste0("Scenario ", scen, ": CI width, best-fitting by ", ictype))) +
+#           theme_classic()
+# ggsave(file = paste0(filepath, "/ChapterOne/figures/plot_width_best", ictype, scen, ".", filetype), 
+#        plot, width = 7, height = 10, units = "in", dpi = 300)
+
+plot <- results2_best %>% 
+        filter(category == measures) %>% 
+        ggplot(aes(x = prop_e, 
+                   y = mae, 
+                   group = s_size, 
+                   color = as.factor(s_size))) +
+          geom_line() +
+  
+          geom_errorbar(aes(ymin = (mae - se_mae),
+                            ymax = (mae + se_mae)),
+                        width=0.01) +
+          scale_x_continuous(breaks = seq(0, 1, 0.2)) +
+          facet_grid(category  ~ .,  scales = "free") +
+          labs(color = "Sample size", 
+               x = "Proportion of events") +
+          ggtitle(c(paste0("Scenario ", scen, ": MAE,  best-fitting by ", ictype))) +
+          theme_classic()
+ggsave(file = paste0(filepath, "/ChapterOne/figures/plot_mae_best", ictype, scen, ".", filetype), 
+       plot, width = 7, height = 10, units = "in", dpi = 300)   
+
+plot <- results2_best %>% 
+        filter(category == measures) %>% 
+        ggplot(aes(x = prop_e, 
+                   y = mape, 
+                   group = s_size, 
+                   color = as.factor(s_size))) +
+          geom_line() +
+          geom_errorbar(aes(ymin = (mape - se_mape),
+                            ymax = (mape + se_mape)),
+                        width=0.01) +
+          scale_x_continuous(breaks = seq(0, 1, 0.2)) +
+          scale_y_continuous(labels = scales::percent) +
+          facet_grid(category  ~ .,  scales = "fixed") +
+          labs(color = "Sample size", 
+               x = "Proportion of events") +
+          ggtitle(c(paste0("Scenario ", scen, ": MAPE, best-fitting by ", ictype))) +
+          theme_classic()
+ggsave(file = paste0(filepath, "/ChapterOne/figures/plot_mape_best", ictype, scen, ".", filetype), 
+       plot, width = 7, height = 10, units = "in", dpi = 300) 
+
+
+plot <- results2_best %>% 
+        filter(category == measures) %>% 
+        ggplot(aes(x = prop_e, 
+                   y = rmse, 
+                   group = s_size, 
+                   color = as.factor(s_size))) +
+          geom_line() +
+          geom_errorbar(aes(ymin = (rmse - rmse_mcse),
+                            ymax = (rmse + rmse_mcse)),
+                        width = 0.01) +
+          scale_x_continuous(breaks = seq(0, 1, 0.2)) +
+          facet_grid(category  ~ .,  scales = "free") +
+          labs(color = "Sample size", 
+               x = "Proportion of events") +
+          ggtitle(c(paste0("Scenario ", scen, ": RMSE, best-fitting by ", ictype))) +
+          theme_classic()
+ggsave(file = paste0(filepath, "/ChapterOne/figures/plot_rmse_best", ictype, scen, ".", filetype), 
+       plot, width = 7, height = 10, units = "in", dpi = 300)  
+
+p1 <- results2_best %>% 
+        filter(category == measures) %>% 
+        ggplot(aes(x = prop_e, 
+                   y = prop20, 
+                   group = s_size, 
+                   color = as.factor(s_size))) +
+        geom_line() +
+        geom_errorbar(aes(ymin = (prop20 - sqrt(prop20 * (1 - prop20) / n_sim)), 
+                          ymax = (prop20 + sqrt(prop20 * (1 - prop20) / n_sim))), 
+                      width=.01) +                      
+        labs(color = "Sample size", 
+               x = "Proportion of events",
+               y = "Proportion of replications with >20% difference from true population") +
+        ggtitle(c(paste0("Scenario ", scen,": Probability of >20% difference, best-fitting by ", ictype))) +
+        scale_x_continuous(breaks = seq(0, 1, 0.2)) +
+        facet_grid(category  ~ ., scales = "fixed") +
+        ylim(c(0, 1)) +
+        theme_classic()
+ggsave(file = paste0(filepath, "/ChapterOne/figures/plotpropdiff_best", ictype, scen, ".", filetype), 
+       p1, width = 7, height = 10, units = "in", dpi = 300)
+
+plot <- results2_best %>% 
+        filter(category == measures) %>% 
+        ggplot(aes(x = prop_e, 
+                   y = mae, 
+                   group = s_size, 
+                   color = as.factor(s_size))) +
+          geom_line() +
+          geom_errorbar(aes(ymin = (mae - se_mae),
+                            ymax = (mae + se_mae)),
+                        width = 0.01) +
+          scale_x_continuous(breaks = seq(0, 1, 0.2)) +
+          scale_y_log10() +
+          facet_grid(category  ~ .,  scales = "free") +
+          labs(color = "Sample size", 
+               x = "Proportion of events") +
+          ggtitle(c(paste0("Scenario ", scen, ": MAE, best-fitting by ", ictype, ", y-axis on logarithmic scale"))) +
+          theme_classic()
+ggsave(file = paste0(filepath, "/ChapterOne/figures/plot_mae_log_best", ictype, scen, ".", filetype), 
+       plot, width = 7, height = 10, units = "in", dpi = 300)  
+
+
+plot <- results2_best %>% 
+        filter(category == measures) %>% 
+        ggplot(aes(x = prop_e, 
+                   y = rmse, 
+                   group = s_size, 
+                   color = as.factor(s_size))) +
+          geom_line() +
+          geom_errorbar(aes(ymin = (rmse - rmse_mcse),
+                            ymax = (rmse + rmse_mcse)),
+                        width = 0.01) +
+          scale_x_continuous(breaks = seq(0, 1, 0.2)) +
+          scale_y_log10() +
+          facet_grid(category  ~ .,  scales = "free") +
+          labs(color = "Sample size", 
+               x = "Proportion of events") +
+          ggtitle(c(paste0("Scenario ", scen, ": RMSE, best-fitting by ", ictype, ", y-axis on logarithmic scale"))) +
+          theme_classic()
+ggsave(file = paste0(filepath, "/ChapterOne/figures/plot_rmse_log_best", ictype, scen, ".", filetype), 
+       plot, width = 7, height = 10, units = "in", dpi = 300)   
+
+```
+
+The following chunks load results and set up plots to summarize across scenarios and across IC types
+
+```{r Summary of simulation: Loading data for all four scenarios}
+
+# To work just with data for plots
+# rm(list=ls())
+# filepath <- getwd()
+# load(file = paste0(filepath, "/ChapterOne/setup.Rdata"))
+# load(file = paste0(filepath,"/ChapterOne/Scenario", scen, "/pop.Rdata"))
+
+# To load population data
+
+pop_data <- lapply(seq_along(scens), function(i) {
+       read.csv(file = paste0(filepath, "/ChapterOne/tables/popvalues", scens[[i]], ".csv"))
+})
+
+pop_data <- dplyr::bind_rows(pop_data, .id = "Scenario")
+
+## To load one set of results for all four scenarios
+
+resultstype <- "_bestBIC"  ## "", "_bestAIC", etc
+
+results_data <- lapply(seq_along(scens), function(i) {
+       read.csv(file = paste0(filepath, "/ChapterOne/tables/results", resultstype, scens[[i]], ".csv"))
+})
+
+results_data <- dplyr::bind_rows(results_data, .id = "Scenario") %>%
+  filter(category != "rate") %>% 
+  mutate(category_f = factor(category, levels = c("median", "oneyear", "timehorizon", "rmstpop99", "rmstsample99")))
+
+```
+
+```{r Graphing results for all four scenarios}
+
+measures <-as.character(unique(results_data$category))
+
+# Appendix Figure 8 - 10
+plot <- results_data %>% 
+        filter(category == measures) %>% 
+        ggplot(aes(x = prop_e, 
+                   y = cover, 
+                   group = s_size, 
+                   color = as.factor(s_size))) +
+          geom_line() +
+          geom_errorbar(aes(ymin = (cover - sqrt(cover * (1 - cover) / n_sim)), 
+                            ymax = (cover + sqrt(cover * (1 - cover) / n_sim))), 
+                        width = .01) +
+          scale_x_continuous(breaks = seq(0, 1, 0.2)) +
+          facet_grid(category_f  ~ Scenario,  scales = "fixed", labeller = labeller(category_f = labels)) +
+          labs(color = "Sample size", 
+               x = "Proportion of events",
+               y = "Coverage") +
+          ggtitle(c(paste0("Coverage"))) +
+          theme_classic() +
+          geom_hline(yintercept = 0.95, color = "grey") +
+          geom_hline(yintercept = 0.955, color = "grey", linetype = "dashed") + 
+          geom_hline(yintercept = 0.945, color = "grey", linetype = "dashed") + 
+          theme(panel.border = element_rect(fill = NA),
+                panel.spacing = unit(0, "cm")) +
+          theme(legend.position="bottom", legend.box = "horizontal") +
+          guides(colour = guide_legend(nrow = 1))
+ggsave(file = paste0(filepath, "/ChapterOne/figures/plot_cover_allscen", resultstype, ".", filetype), 
+       plot, width = 10, height = 10, units = "in", dpi = 300)
+
+
+# Appendix figures 14-16
+plot <- results_data %>% 
+        filter(category == measures) %>% 
+        ggplot(aes(x = prop_e, 
+                   y = mape, 
+                   group = s_size, 
+                   color = as.factor(s_size))) +
+          geom_line() +
+          geom_errorbar(aes(ymin = (mape - se_mape),
+                            ymax = (mape + se_mape)),
+                        width=0.01) +
+          scale_x_continuous(breaks = seq(0, 1, 0.2)) +
+          scale_y_continuous(labels = scales::percent) +  
+          facet_grid(category_f  ~ Scenario,  scales = "free", labeller = labeller(category_f = labels)) +
+          labs(color = "Sample size", 
+               x = "Proportion of events",
+               y = "Mean absolute percent error (MAPE)") +
+          ggtitle(c(paste0("MAPE"))) +
+          theme_classic() + 
+          theme(panel.border = element_rect(fill = NA),
+                panel.spacing = unit(0, "cm")) +
+          theme(legend.position="bottom", legend.box = "horizontal") +
+          guides(colour = guide_legend(nrow = 1))
+ggsave(file = paste0(filepath, "/ChapterOne/figures/plot_mape_allscen", resultstype, ".", filetype), 
+       plot, width = 10, height = 10, units = "in", dpi = 300)
+
+# Appendix figures 17-19
+plot <- results_data %>% 
+        filter(category == measures) %>% 
+        ggplot(aes(x = prop_e, 
+                   y = mae, 
+                   group = s_size, 
+                   color = as.factor(s_size))) +
+          geom_line() +
+          geom_errorbar(aes(ymin = (mae - se_mae),
+                            ymax = (mae + se_mae)),
+                        width = 0.01) +
+          scale_x_continuous(breaks = seq(0, 1, 0.2)) +
+          scale_y_log10() +
+         facet_grid(category_f  ~ Scenario,  scales = "free", labeller = labeller(category_f = labels)) +
+          labs(color = "Sample size", 
+               x = "Proportion of events",
+               y = "Mean absolute error (MAE), y-axis on logarithmic scale") +
+          ggtitle(c(paste0("MAE"))) +
+          theme_classic() + 
+          theme(panel.border = element_rect(fill = NA),
+                panel.spacing = unit(0, "cm")) +
+          theme(legend.position="bottom", legend.box = "horizontal") +
+          guides(colour = guide_legend(nrow = 1))
+ggsave(file = paste0(filepath, "/ChapterOne/figures/plot_mae_log_allscen", resultstype, ".", filetype), 
+       plot, width = 10, height = 10, units = "in", dpi = 300)
+
+# Appendix figure 20-22
+p1 <- results_data %>% 
+        filter(category == measures) %>% 
+        ggplot(aes(x = prop_e, 
+                   y = as.factor(s_size),
+                   fill = prop20)) +
+        geom_tile() +
+        geom_text(aes(label = scales::percent(prop20)), size = 2.5, show.legend = NA) +
+        labs(x = "Proportion of events",
+             y = "Sample size") +
+        ggtitle(c(paste0("Probability of >20% difference"))) +
+        scale_x_continuous(breaks = seq(0, 1, 0.2)) +
+        facet_grid(category_f  ~ Scenario, scales = "fixed", labeller = labeller(category_f = labels)) +
+        scale_fill_gradient(name = "Proportion of \n repetitions",
+                            low = "white",
+                            high = "darkred",
+                            n.breaks = 10) +
+        theme_classic() + 
+        theme(legend.position="bottom",     
+        legend.key.width=grid::unit(0.5,"in"))
+ggsave(file = paste0(filepath, "/ChapterOne/figures/plotpropdiff_heattext", resultstype, ".", filetype), 
+       p1, width = 12, height = 10, units = "in", dpi = 300)
+
+plot <- results_data %>% 
+        filter(category == measures) %>% 
+        ggplot(aes(x = prop_e, 
+                   y = rmse, 
+                   group = s_size, 
+                   color = as.factor(s_size))) +
+          geom_line() +
+          geom_errorbar(aes(ymin = (rmse - rmse_mcse),
+                            ymax = (rmse + rmse_mcse)),
+                        width = 0.01) +
+          scale_x_continuous(breaks = seq(0, 1, 0.2)) +
+         facet_grid(category_f  ~ Scenario,  scales = "free", labeller = labeller(category_f = labels)) +
+          labs(color = "Sample size", 
+               x = "Proportion of events") +
+          ggtitle(c(paste0("RMSE"))) +
+          theme_classic() + 
+          theme(panel.border = element_rect(fill = NA),
+                panel.spacing = unit(0, "cm"))
+ggsave(file = paste0(filepath, "/ChapterOne/figures/plot_rmse_allscen", resultstype, ".", filetype), 
+       plot, width = 10, height = 6.5, units = "in", dpi = 300)
+
+plot <- results_data %>% 
+        filter(category == measures) %>% 
+        ggplot(aes(x = prop_e, 
+                   y = mae, 
+                   group = s_size, 
+                   color = as.factor(s_size))) +
+          geom_line() +
+          geom_errorbar(aes(ymin = (mae - se_mae),
+                            ymax = (mae + se_mae)),
+                        width=0.01) +
+          scale_x_continuous(breaks = seq(0, 1, 0.2)) +
+          facet_grid(category_f  ~ Scenario,  scales = "free", labeller = labeller(category_f = labels)) +
+          labs(color = "Sample size", 
+               x = "Proportion of events",
+               y = "Mean absolute error (MAE)") +
+          ggtitle(c(paste0("MAE"))) +
+          theme_classic() + 
+          theme(panel.border = element_rect(fill = NA),
+                panel.spacing = unit(0, "cm")) +
+          theme(legend.position="bottom", legend.box = "horizontal") +
+          guides(colour = guide_legend(nrow = 1))
+ggsave(file = paste0(filepath, "/ChapterOne/figures/plot_mae_allscen", resultstype, ".", filetype), 
+       plot, width = 10, height = 10, units = "in", dpi = 300)
+
+plot <- results_data %>% 
+        filter(category == measures) %>% 
+        ggplot(aes(x = prop_e, 
+                   y = rmse, 
+                   group = s_size, 
+                   color = as.factor(s_size))) +
+          geom_line() +
+          geom_errorbar(aes(ymin = (rmse - rmse_mcse),
+                            ymax = (rmse + rmse_mcse)),
+                        width = 0.01) +
+          scale_x_continuous(breaks = seq(0, 1, 0.2)) +
+          scale_y_log10() +
+         facet_grid(category_f  ~ Scenario,  scales = "free", labeller = labeller(category_f = labels)) +
+          labs(color = "Sample size", 
+               x = "Proportion of events", 
+               y = "Root mean squared error (RMSE), y-axis on logarithmic scale") +
+          ggtitle(c(paste0("RMSE, y-axis on logarithmic scale"))) +
+          theme_classic() + 
+          theme(panel.border = element_rect(fill = NA),
+                panel.spacing = unit(0, "cm")) +
+          theme(legend.position="bottom", legend.box = "horizontal") +
+          guides(colour = guide_legend(nrow = 1))
+
+ggsave(file = paste0(filepath, "/ChapterOne/figures/plot_rmse_log_allscen", resultstype, ".", filetype), 
+       plot, width = 10, height = 10, units = "in", dpi = 300)
+
+plot <- results_data %>%
+        filter(category == measures) %>%
+        ggplot(aes(x = prop_e,
+                   y = mean_width,
+                   group = s_size,
+                   color = as.factor(s_size))) +
+          geom_line() +
+          geom_errorbar(aes(ymin = (mean_width - se_width),
+                            ymax = (mean_width + se_width)),
+                        width = .01) +                        
+          scale_x_continuous(breaks = seq(0, 1, 0.2)) +
+          facet_grid(category  ~ Scenario,  scales = "free") +
+          labs(color = "Sample size",
+               x = "Proportion of events") +
+          ggtitle(c(paste0("CI width"))) +
+          theme_classic() + 
+          theme(panel.border = element_rect(fill = NA),
+                panel.spacing = unit(0, "cm"))
+ggsave(file = paste0(filepath, "/ChapterOne/figures/plot_width_allscen", resultstype, ".", filetype), 
+       plot, width = 10, height = 6.5, units = "in", dpi = 300)
+
+plot <- results_2 %>% 
+        ggplot(aes(x = prop_e, 
+                   y = mae_p, 
+                   group = s_size, 
+                   color = as.factor(s_size))) +
+          geom_line() +
+          scale_x_continuous(breaks = seq(0, 1, 0.2)) +
+          facet_grid(category  ~ Scenario,  scales = "free") +
+          labs(color = "Sample size", 
+               x = "Proportion of events",
+               y = "MAE as a percentage of population value") +
+          ggtitle(c(paste0("MAE percentage"))) +
+          theme_classic() + 
+          theme(panel.border = element_rect(fill = NA),
+                panel.spacing = unit(0, "cm"),
+                panel.grid.major.y = element_line(colour = "grey", linetype = "dashed"))
+ggsave(file = paste0(filepath, "/ChapterOne/figures/plot_mae_percentline", resultstype, ".", filetype), 
+       plot, width = 10, height = 6.5, units = "in", dpi = 300)
+
+```
+
+```{r Graphing accruals and failures for all four scenarios}
+
+## Plotting accrual across four scenarios
+
+p1 <- ggplot(results_data, aes(x = prop_e, 
+                         y = prop_n, 
+                         group = s_size, 
+                         color = as.factor(s_size))) +
+        geom_line() +
+        labs(color = "Sample size", 
+             x = "Proportion of events", 
+             y = "Proportion of target sample accrued") +
+        scale_x_continuous(breaks = seq(0, 1, 0.2)) +
+        ylim(c(0, 1)) +
+       facet_wrap(  ~ Scenario,  scales = "free") +
+        theme_classic()
+
+ggsave(file = paste0(filepath, "/ChapterOne/figures/plotaccrued_allscen", resultstype, ".", filetype), 
+       p1, width = 6, height = 4, units = "in", dpi = 300)
+
+## Failures
+
+fails_data <- lapply(seq_along(scens), function(i) {
+       read.csv(file = paste0(filepath,"/ChapterOne/tables/failsgroups", scens[[i]], ".csv"))
+})
+
+fails_data <- dplyr::bind_rows(fails_data, .id = "Scenario")
+
+# Plot
+plot <- ggplot(fails_data, aes(x = prop_e,
+                                y = 1 - none /(n_sim *  length(distribs)),
+                                group = s_size,
+                                color = as.factor(s_size))) +
+               geom_line() +
+               labs(title = paste0("Proportion of failures among the six distibutions"),
+                    color = "Sample size",
+                    x = "Proportion of events",
+                    y = "Proportion failed") +
+               scale_x_continuous(breaks=seq(0, 1, 0.2)) +
+               ylim(0, 1) +
+               facet_wrap(.  ~ Scenario,  scales = "free") +
+               theme_classic()
+ggsave(file = paste0(filepath, "/ChapterOne/figures/plot_failsgroups_allscen.", filetype), 
+       plot, width = 6, height = 4, units = "in", dpi = 300)
+
+```
+
+```{r Graphing proportion best-fitting across ICs or scenarios}
+
+## To plot proportion best-fitting for one scenario -- Figure 2
+
+group <- c("aic", "aicc", "bic", "bicc")
+
+results_summary <- lapply(seq_along(group), function(i){
+  read.csv(file = paste0(filepath, "/ChapterOne/tables/summary_", group[[i]], scen, ".csv"))
+  })
+names(results_summary) <- c("AIC","AICc", "BIC", "BICc")
+
+results_summary <- dplyr::bind_rows(results_summary, .id = "criteria")
+
+plot <- ggplot(results_summary, aes(x = prop_e,
+                                y = prop_exp,
+                                group = s_size,
+                                color = as.factor(s_size))) +
+               geom_line() +
+               labs(title = paste0("Scenario ", scen),
+                    color = "Sample size",
+                    x = "Proportion of events",
+                    y = "Proportion exponential as best fit by IC type") +
+               scale_x_continuous(breaks=seq(0, 1, 0.2)) +
+               ylim(0, 1) +
+               facet_grid(. ~ criteria, scales = "free") +
+               theme_classic() +
+               theme(legend.position="bottom", legend.box = "horizontal") +
+               guides(colour = guide_legend(nrow = 1))
+ggsave(file = paste0(filepath, "/ChapterOne/figures/plot_proportion_expIC", scen, ".", filetype), 
+       plot, width = 7, height = 4, units = "in", dpi = 300)
+
+## Load data for proportion best-fitting for all scenarios -- Appendix Figure 4?
+
+group <- c("AIC", "BIC")
+
+results_summary_all <- lapply(seq_along(scens), function(j) {
+  results_summary <- lapply(seq_along(group), function(i){
+    read.csv(file = paste0(filepath, "/ChapterOne/tables/summary_", group[[i]], scens[[j]], ".csv"))
+    })
+  names(results_summary) <- c("AIC", "BIC")
+  results_summary <- dplyr::bind_rows(results_summary, .id = "criteria")
+})
+
+results_summary_all <- dplyr::bind_rows(results_summary_all, .id = "Scenario")
+
+## To plot proportion best-fitting for all scenarios
+
+plot <- ggplot(results_summary_all, aes(x = prop_e,
+                                y = prop_exp,
+                                group = s_size,
+                                color = as.factor(s_size))) +
+               geom_line() +
+               labs(title = paste0("Proportion identifying true distibution as best-fitting"),
+                    color = "Sample size",
+                    x = "Proportion of events",
+                    y = "Proportion exponential as best fit by AIC or BIC") +
+               scale_x_continuous(breaks=seq(0, 1, 0.2)) +
+               ylim(0, 1) +
+               facet_grid(criteria ~ Scenario, scales = "free") +
+               theme_classic()
+ggsave(file = paste0(filepath, "/ChapterOne/figures/plot_proportion_exp_all.", filetype), 
+       plot, width = 7, height = 4, units = "in", dpi = 300)
+```
+
+```{r Graphing by AIC and BIC}
+
+## To load all sets of results of one scenario
+
+# Load exponential
+
+scen <- 1
+
+results2 <- read.csv(file = paste0(filepath, "/ChapterOne/tables/results", scen, ".csv")) %>% 
+  mutate(category_f = factor(category, levels = c("median", "oneyear", "timehorizon", "rmstpop99", "rmstsample99")))
+
+# Load IC results for one scenario
+
+group <- c("AIC", "BIC", "AICc", "BICc")
+
+results_best2 <- lapply(seq_along(group), function(i){
+  read.csv(file = paste0(filepath, "/ChapterOne/tables/results_best", group[[i]], scen, ".csv"))
+  })
+names(results_best2) <- c("AIC", "BIC", "AICc", "BICc")
+results_best2 <- dplyr::bind_rows(results_best2, .id = "criteria") %>% 
+  mutate(category_f = factor(category, levels = c("median", "oneyear", "timehorizon", "rmstpop99", "rmstsample99")))
+
+# Merge all sets of results for one scenario
+
+results_overall <- results2 %>% 
+  mutate(criteria = "Exponential") %>% 
+  filter(category != "rate") %>% 
+  bind_rows (., results_best2) %>% 
+  mutate(criteria_f = factor(criteria, levels = c("Exponential", "AIC", "AICc", "BIC", "BICc")))
+
+# Labels
+
+labels <- c(median = "Median", 
+            oneyear = "One-year survival", 
+            timehorizon = "Sample time horizon",             
+            rmstpop99 = "Population time horizon RMST",
+            rmstsample99 = "Sample time horizon RMST")
+
+## Plot results by AIC/BIC
+
+measures <-as.character(unique(results_best2$category))
+
+# Appendix Figure 7
+plot <- results_best2 %>% 
+        filter(category == measures) %>% 
+        ggplot(aes(x = prop_e, 
+                   y = cover, 
+                   group = s_size, 
+                   color = as.factor(s_size))) +
+          geom_line() +
+          geom_errorbar(aes(ymin = (cover - sqrt(cover * (1 - cover) / n_sim)), 
+                            ymax = (cover + sqrt(cover * (1 - cover) / n_sim))), 
+                        width = .01) +
+          facet_grid(category_f  ~ criteria, scales = "free", labeller = labeller(category_f = labels)) +
+          scale_x_continuous(breaks = seq(0, 1, 0.2)) +
+          labs(color = "Sample size", 
+               x = "Proportion of events",
+               y = "Coverage") +
+          ggtitle(c(paste0("Scenario ", scen,": Coverage, best-fitting by IC"))) +
+          theme_classic() +
+          geom_hline(yintercept = 0.95, color = "grey") +
+          geom_hline(yintercept = 0.955, color = "grey", linetype = "dashed") + 
+          geom_hline(yintercept = 0.945, color = "grey", linetype = "dashed") +
+          theme(legend.position="bottom", legend.box = "horizontal") +
+          guides(colour = guide_legend(nrow = 1))
+ggsave(file = paste0(filepath, "/ChapterOne/figures/plot_cover_bestIC", scen, ".", filetype), 
+       plot, width = 10, height = 10, units = "in", dpi = 300)
+
+# Appendix Figure 13
+plot <- results_best2 %>% 
+        filter(category == measures) %>% 
+        ggplot(aes(x = prop_e, 
+                   y = mape, 
+                   group = s_size, 
+                   color = as.factor(s_size))) +
+          geom_line() +
+          geom_errorbar(aes(ymin = (mape - se_mape),
+                            ymax = (mape + se_mape)),
+                        width = 0.01) +
+          scale_x_continuous(breaks = seq(0, 1, 0.2)) +
+          scale_y_continuous(labels = scales::percent) +
+          facet_grid(category  ~ criteria, scales = "free", labeller = labeller(category_f = labels)) +
+          labs(color = "Sample size", 
+               x = "Proportion of events", 
+               y = "Mean absolute percent error (MAPE)") +
+          ggtitle(c(paste0("Scenario ", scen, ": MAPE"))) +
+          theme_classic() +
+          theme(legend.position="bottom", legend.box = "horizontal") +
+          guides(colour = guide_legend(nrow = 1))
+ggsave(file = paste0(filepath, "/ChapterOne/figures/plot_mape_bestIC", scen, ".", filetype), 
+       plot, width = 10, height = 10, units = "in", dpi = 300)  
+
+
+plot <- results_best2 %>% 
+        filter(category == measures) %>% 
+        ggplot(aes(x = prop_e, 
+                   y = mae, 
+                   group = s_size, 
+                   color = as.factor(s_size))) +
+          geom_line() +
+          geom_errorbar(aes(ymin = (mae - se_mae),
+                            ymax = (mae + se_mae)),
+                        width = 0.01) +
+          scale_x_continuous(breaks = seq(0, 1, 0.2)) +
+          scale_y_log10() +
+          facet_grid(category  ~ criteria, scales = "free", labeller = labeller(category_f = labels)) +
+          labs(color = "Sample size", 
+               x = "Proportion of events", 
+               y = "Mean absolute error (MAE), y-axis on logarithmic scale") +
+          ggtitle(c(paste0("Scenario ", scen, ": MAE"))) +
+          theme_classic() +
+          theme(legend.position="bottom", legend.box = "horizontal") +
+          guides(colour = guide_legend(nrow = 1))
+ggsave(file = paste0(filepath, "/ChapterOne/figures/plot_mae_log_bestIC", scen, ".", filetype), 
+       plot, width = 10, height = 10, units = "in", dpi = 300)  
+
+plot <- results_best2 %>% 
+        filter(category == measures) %>% 
+        ggplot(aes(x = prop_e, 
+                   y = rmse, 
+                   group = s_size, 
+                   color = as.factor(s_size))) +
+          geom_line() +
+          geom_errorbar(aes(ymin = (rmse - rmse_mcse),
+                            ymax = (rmse + rmse_mcse)),
+                        width = 0.01) +
+          scale_x_continuous(breaks = seq(0, 1, 0.2)) +
+          scale_y_log10() +
+          facet_grid(category  ~ criteria, scales = "free") +
+          labs(color = "Sample size", 
+               x = "Proportion of events") +
+          ggtitle(c(paste0("Scenario ", scen, ": RMSE, best-fitting by AIC or BIC, y-axis on logarithmic scale"))) +
+          theme_classic()
+ggsave(file = paste0(filepath, "/ChapterOne/figures/plot_rmse_log_bestboth", scen, ".", filetype), 
+       plot, width = 7, height = 7.5, units = "in", dpi = 300)    
+
+## Plot overall results for one scenario
+
+plot <- results_overall %>% 
+        filter(category == measures) %>% 
+        ggplot(aes(x = prop_e, 
+                   y = cover, 
+                   group = s_size, 
+                   color = as.factor(s_size))) +
+          geom_line() +
+          geom_errorbar(aes(ymin = (cover - sqrt(cover * (1 - cover) / n_sim)), 
+                            ymax = (cover + sqrt(cover * (1 - cover) / n_sim))), 
+                        width = .01) +
+          facet_grid(category_f  ~ criteria_f, scales = "free", labeller = labeller (category_f = labels)) +
+          scale_x_continuous(breaks = seq(0, 1, 0.2)) +
+          labs(color = "Sample size", 
+               x = "Proportion of events",
+               y = "Coverage") +
+          ggtitle(c(paste0("Scenario ", scen,": Coverage"))) +
+          theme_classic() +
+          geom_hline(yintercept = 0.95, color = "grey") +
+          geom_hline(yintercept = 0.955, color = "grey", linetype = "dashed") + 
+          geom_hline(yintercept = 0.945, color = "grey", linetype = "dashed") +
+          theme(legend.position="bottom", legend.box = "horizontal") +
+          guides(colour = guide_legend(nrow = 1))
+ggsave(file = paste0(filepath, "/ChapterOne/figures/plot_cover_all", scen, ".", filetype), 
+       plot, width = 10, height = 10, units = "in", dpi = 300)
+
+# Figure 3
+
+plot <- results_overall %>% 
+        filter(category == measures) %>% 
+        filter(criteria  %in% c("Exponential", "AIC", "BIC")) %>% 
+        ggplot(aes(x = prop_e, 
+                   y = cover, 
+                   group = s_size, 
+                   color = as.factor(s_size))) +
+          geom_line() +
+          geom_errorbar(aes(ymin = (cover - sqrt(cover * (1 - cover) / n_sim)), 
+                            ymax = (cover + sqrt(cover * (1 - cover) / n_sim))), 
+                        width = .01) +
+          facet_grid(category_f  ~ criteria_f, scales = "free", labeller = labeller (category_f = labels)) +
+          scale_x_continuous(breaks = seq(0, 1, 0.2)) +
+          scale_y_continuous(labels = scales::percent) +
+          labs(color = "Sample size", 
+               x = "Proportion of events",
+               y = "Coverage") +
+          ggtitle(c(paste0("Scenario ", scen,": Coverage"))) +
+          theme_classic() +
+          geom_hline(yintercept = 0.95, color = "grey") +
+          geom_hline(yintercept = 0.955, color = "grey", linetype = "dashed") + 
+          geom_hline(yintercept = 0.945, color = "grey", linetype = "dashed") +
+          theme(legend.position="bottom", legend.box = "horizontal") +
+          guides(colour = guide_legend(nrow = 1))
+ggsave(file = paste0(filepath, "/ChapterOne/figures/plot_cover_main", scen, ".", filetype), 
+       plot, width = 8, height = 10, units = "in", dpi = 300)
+
+#Appendix figure 11
+plot <- results_overall %>% 
+        filter(category == measures) %>% 
+        ggplot(aes(x = prop_e, 
+                   y = mae, 
+                   group = s_size, 
+                   color = as.factor(s_size))) +
+          geom_line() +
+          geom_errorbar(aes(ymin = (mae - se_mae),
+                            ymax = (mae + se_mae)),
+                        width = 0.01) +
+          scale_x_continuous(breaks = seq(0, 1, 0.2)) +
+          scale_y_log10() +
+          facet_grid(category_f  ~ criteria_f, scales = "free_y", labeller = labeller(category_f = labels)) +
+          labs(color = "Sample size", 
+               x = "Proportion of events",
+               y = "Mean absolute error (MAE), y-axis on logarithmic scale") +
+          ggtitle(c(paste0("Scenario ", scen, ": MAE"))) +
+          theme_classic() +
+          theme(legend.position="bottom", legend.box = "horizontal") +
+          guides(colour = guide_legend(nrow = 1))
+ggsave(file = paste0(filepath, "/ChapterOne/figures/plot_mae_log_all", scen, ".", filetype), 
+       plot, width = 10, height = 10, units = "in", dpi = 300)  
+
+
+plot <- results_overall %>% 
+        filter(category == measures) %>% 
+        ggplot(aes(x = prop_e, 
+                   y = mape, 
+                   group = s_size, 
+                   color = as.factor(s_size))) +
+          geom_line() +
+          geom_errorbar(aes(ymin = (mape - se_mape),
+                            ymax = (mape + se_mape)),
+                        width = 0.01) +
+          scale_x_continuous(breaks = seq(0, 1, 0.2)) +
+          scale_y_continuous(labels = scales::percent) +
+          facet_grid(category_f  ~ criteria_f, scales = "fixed", labeller = labeller (category_f = labels)) +
+          labs(color = "Sample size", 
+               x = "Proportion of events") +
+          ggtitle(c(paste0("Scenario ", scen, ": MAPE"))) +
+          theme_classic() +
+          theme(legend.position="bottom", legend.box = "horizontal") +
+          guides(colour = guide_legend(nrow = 1))
+ggsave(file = paste0(filepath, "/ChapterOne/figures/plot_mape_all", scen, ".", filetype), 
+       plot, width = 10, height = 10, units = "in", dpi = 300)  
+
+# Figure 4
+
+plot <- results_overall %>% 
+        filter(category == measures) %>% 
+        filter(criteria  %in% c("Exponential", "AIC", "BIC")) %>% 
+        ggplot(aes(x = prop_e, 
+                   y = mape, 
+                   group = s_size, 
+                   color = as.factor(s_size))) +
+          geom_line() +
+          geom_errorbar(aes(ymin = (mape - se_mape),
+                            ymax = (mape + se_mape)),
+                        width = 0.01) +
+          scale_x_continuous(breaks = seq(0, 1, 0.2)) +
+          scale_y_continuous(labels = scales::percent) +
+          facet_grid(category_f  ~ criteria_f, scales = "fixed", labeller = labeller (category_f = labels)) +
+          labs(color = "Sample size", 
+               x = "Proportion of events",
+               y = "Mean absolute percentage error (MAPE)") +
+          ggtitle(c(paste0("Scenario ", scen, ": MAPE"))) +
+          theme_classic() +
+          theme(legend.position="bottom", legend.box = "horizontal") +
+          guides(colour = guide_legend(nrow = 1))
+ggsave(file = paste0(filepath, "/ChapterOne/figures/plot_mape_main", scen, ".", filetype), 
+       plot, width = 10, height = 10, units = "in", dpi = 300)  
+
+# Appendix Figure 12
+plot <- results_overall %>% 
+        filter(category == measures) %>% 
+        ggplot(aes(x = prop_e, 
+                   y = rmse, 
+                   group = s_size, 
+                   color = as.factor(s_size))) +
+          geom_line() +
+          geom_errorbar(aes(ymin = (rmse - rmse_mcse),
+                            ymax = (rmse + rmse_mcse)),
+                        width = 0.01) +
+          scale_x_continuous(breaks = seq(0, 1, 0.2)) +
+          scale_y_log10() +
+          facet_grid(category_f  ~ criteria_f, scales = "free", labeller = labeller (category_f = labels)) +
+          labs(color = "Sample size", 
+               x = "Proportion of events", 
+               y = "Root mean squared error (RMSE), y-axis on logarithmic scale") +
+          ggtitle(c(paste0("Scenario ", scen, ": RMSE"))) +
+          theme_classic() +
+          theme(legend.position="bottom", legend.box = "horizontal") +
+          guides(colour = guide_legend(nrow = 1))
+ggsave(file = paste0(filepath, "/ChapterOne/figures/plot_rmse_log_all", scen, ".", filetype), 
+       plot, width = 10, height = 10, units = "in", dpi = 300)    
+
+p1 <- results_overall %>% 
+        filter(category == measures) %>% 
+        filter(criteria  %in% c("Exponential", "AIC", "BIC")) %>% 
+        ggplot(aes(x = prop_e, 
+                   y = prop20, 
+                   group = s_size, 
+                   color = as.factor(s_size))) +
+        geom_line() +
+        geom_errorbar(aes(ymin = (prop20 - sqrt(prop20 * (1 - prop20) / n_sim)), 
+                          ymax = (prop20 + sqrt(prop20 * (1 - prop20) / n_sim))), 
+                      width=.01) +                      
+        labs(color = "Sample size", 
+               x = "Proportion of events",
+               y = "Proportion of replications with >20% difference from true population") +
+        ggtitle(c(paste0("Scenario ", scen,": Probability of >20% difference"))) +
+        scale_x_continuous(breaks = seq(0, 1, 0.2)) +
+        facet_grid(category_f  ~ criteria_f, scales = "fixed", labeller = labeller(category_f = labels)) +
+        ylim(c(0, 1)) +
+        theme_classic() + 
+        theme(legend.position="bottom", legend.box = "horizontal") +
+        guides(colour = guide_legend(nrow = 1))
+ggsave(file = paste0(filepath, "/ChapterOne/figures/plotpropdiff_main", scen, ".", filetype), 
+       p1, width = 10, height = 10, units = "in", dpi = 300)
+
+# Figure 5 
+
+p1 <- results_overall %>% 
+        filter(category == measures) %>% 
+        filter(criteria  %in% c("Exponential", "AIC", "BIC")) %>% 
+        ggplot(aes(x = prop_e, 
+                   y = as.factor(s_size),
+                   fill = prop20)) +
+        geom_tile() +
+        geom_text(aes(label = scales::percent(prop20)), size = 2.5, show.legend = NA) +
+        labs(x = "Proportion of events",
+             y = "Sample size") +
+        ggtitle(c(paste0("Scenario ", scen,": Probability of >20% difference"))) +
+        scale_x_continuous(breaks = seq(0, 1, 0.2)) +
+        facet_grid(category_f  ~ criteria_f, scales = "fixed", labeller = labeller(category_f = labels)) +
+        scale_fill_gradient(name = "Proportion of \n replications",
+                            low = "white",
+                            high = "darkred",
+                            n.breaks = 10) +
+        theme_classic() + 
+        theme(legend.position="bottom",     
+        legend.key.width=grid::unit(0.5,"in"))
+ggsave(file = paste0(filepath, "/ChapterOne/figures/plotpropdiff_mainheattext", scen, ".", filetype), 
+       p1, width = 9, height = 10, units = "in", dpi = 300)
+
+p1 <- results_overall %>% 
+        filter(category == measures) %>% 
+        filter(criteria  %in% c("Exponential", "AIC", "BIC")) %>% 
+        ggplot(aes(x = prop_e, 
+                   y = as.factor(s_size),
+                   fill = prop20)) +
+        geom_tile() +
+        labs(x = "Proportion of events",
+             y = "Sample size") +
+        ggtitle(c(paste0("Scenario ", scen,": Probability of >20% difference"))) +
+        scale_x_continuous(breaks = seq(0, 1, 0.2)) +
+        facet_grid(category_f  ~ criteria_f, scales = "fixed", labeller = labeller(category_f = labels)) +
+        scale_fill_gradient(name = "Proportion of \n replications",
+                            low = "white",
+                            high = "darkred",
+                            n.breaks = 10) +
+        theme(legend.position="right") 
+ggsave(file = paste0(filepath, "/ChapterOne/figures/plotpropdiff_mainheat", scen, ".", filetype), 
+       p1, width = 10, height = 10, units = "in", dpi = 300)
+
+p1 <- results_overall %>% 
+        filter(category == measures) %>% 
+        filter(criteria  %in% c("Exponential", "AIC", "BIC")) %>% 
+        ggplot(aes(x = prop_e, 
+                   y = as.factor(s_size),
+                   fill = 1- prop20)) +
+        geom_tile() +
+        labs(x = "Proportion of events",
+             y = "Sample size") +
+        ggtitle(c(paste0("Scenario ", scen,": Probability of being within 20% of true value"))) +
+        scale_x_continuous(breaks = seq(0, 1, 0.2)) +
+        facet_grid(category_f  ~ criteria_f, scales = "fixed", labeller = labeller(category_f = labels)) +
+        scale_fill_gradient(name = "Proportion of \n replications",
+                            high = "white",
+                            low = "darkred",
+                            n.breaks = 10) +
+        theme(legend.position="right") 
+ggsave(file = paste0(filepath, "/ChapterOne/figures/plotpropwithin_mainheat", scen, ".", filetype), 
+       p1, width = 10, height = 10, units = "in", dpi = 300)
+
+# p1 <- results_2 %>% 
+#         ggplot(aes(x = prop_e, 
+#                    y = prop20, 
+#                    group = s_size, 
+#                    color = as.factor(s_size))) +
+#         geom_line() +
+#         geom_errorbar(aes(ymin = (prop20 - sqrt(prop20 * (1 - prop20) / n_sim)), 
+#                           ymax = (prop20 + sqrt(prop20 * (1 - prop20) / n_sim))), 
+#                       width=.01) +                      
+#         labs(color = "Sample size", 
+#                x = "Proportion of events",
+#                y = "Proportion of replications with >20% difference from true population") +
+#         ggtitle(c(paste0("Scenario ", scen,": Probability of >20% difference"))) +
+#         scale_x_continuous(breaks = seq(0, 1, 0.2)) +
+#         facet_grid(category  ~ criteria_f,  scales = "free") +
+#         ylim(c(0, 1)) +
+#         theme_classic()
+# ggsave(file = paste0(filepath, "/ChapterOne/figures/plotpropdiff_all", scen, ".", filetype), 
+#        p1, width = 5, height = 7, units = "in", dpi = 300)
+
+```
+
+```{r Extract code}
+# knitr::purl("Chapter1-functionals.Rmd", output = "chapteronefunctionaltest.R")
+```
