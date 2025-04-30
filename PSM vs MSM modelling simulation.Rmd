@@ -1,0 +1,1906 @@
+---
+title: "Thesis Chapter 2"
+author: "Jaclyn Beca"
+date: "`r Sys.Date()`"
+output:
+  word_document:
+    reference_docx: docx_template.docx
+  pdf_document: default
+  html_document:
+    df_print: paged
+---
+
+```{r Setup, include=FALSE}
+rm(list=ls())
+# remotes::install_github("hadley/rlang")
+pacman::p_load_gh("hadley/rlang")
+pacman::p_load(devtools, plyr, multidplyr, tidyverse, survminer, flexsurv, flexsurvcure, gridExtra, knitr, mstate, Metrics, doParallel, simhelpers, ggpubr, bigparallelr, cansim, data.table, MortalityLaws, survHE, mstate, abind, hesim, zoo)
+# install_github("DARTH-git/darthtools", force = TRUE)
+pacman::p_load_gh("DARTH-git/darthtools")
+
+#devtools::install_github("matherealize/looplot")
+pacman::p_load_gh("matherealize/looplot")
+#devtools::install_github("blasern/gems")
+pacman::p_load_gh("blasern/gems")
+
+
+knitr::opts_chunk$set(echo=FALSE, fig.width=8, fig.height=5, fig.path='Figs/', warning=FALSE, message=FALSE, cache.lazy=FALSE)
+# Set filepath and save parameters
+filepath <- getwd()
+options(dplyr.summarise.inform = FALSE)
+source("PSM_MSM_sim_functions.R")
+
+```
+
+# Introduction
+
+This code is used to produce the results for thesis Chapter 2, and the paper "Impact of limited sample size and follow-up on survival extrapolation of multiple events for health technology assessment: A simulation study"
+Built using R version 4.3.1.
+
+# Methods
+
+## Simulation plan
+
+**Aim** The aim of this study is to assess small sample error and coverage when extrapolating survival data with multiple survival endpoints under various conditions with limited data, using a simulation design. 
+**Data generating mechanism** Data were generated from a multistate model using exponential survival distribution, characterized by a constant hazard rate, $\lambda$, or weibull survival distribution, characterized by a scale parameter, $\lambda$ and a shape parameter, $\gamma$. 
+
+## Approach
+
+Scenarios assessing the following factors affecting data generating mechanism: 
+a) true parameter value(s) for hazard function, $\lambda t$, or  $\lambda t^\gamma$., 
+b) sample size of simulated datasets, ($n_{obs}$), 
+c) degree of censoring (proportion of events, $p_{e}$). 
+Within each scenario varied 6 levels of $n_{obs}$ and deciles of $p_{e}$. 
+
+## Global simulation setup 
+The following chunk sets up the sample sizes and file naming, seed and parametric distribution names
+
+```{r Get life table data, eval=FALSE, include=FALSE}
+
+# Get life table data
+
+lifetable <- get_cansim("13-10-0114-01", refresh=FALSE)
+
+lifetable2 <- lifetable %>%
+  filter(GEO == "Canada" &
+         REF_DATE == "2017/2019" &
+         Sex == "Both sexes" &
+         Element == "Death probability between age x and x+1 (qx)")
+
+lifetable2$Year = parse_number(as.character(lifetable2$'Age group'))
+
+lifetable_old <- lifetable %>%
+  filter(GEO == "Canada" &
+         REF_DATE == "1980/1982" &
+         Sex == "Both sexes" &
+         Element == "Death probability between age x and x+1 (qx)")
+
+lifetable_old$Year = parse_number(as.character(lifetable_old$'Age group'))
+
+save(list = c("lifetable", "lifetable2", "lifetable_old"), file = paste0(filepath, "/ChapterTwo/lifetable.Rdata"))
+
+# Set up mortality data for data generation
+
+load(file = paste0(filepath, "/ChapterTwo/lifetable.Rdata"))
+
+mort_gen <- MortalityLaw(x = lifetable_old$Year, qx = lifetable_old$val_norm,
+                law = "kannisto_makeham", fit.this.x = 20:105)
+         
+# plot(predict(mort_gen, x = 60:90), ylim = c(0, 0.3))
+# hgompertz(20, shape = mort$coefficients[2], rate = mort$coefficients[1]) 
+
+# Set up mortality data for reg
+
+mort_reg <- MortalityLaw(x = lifetable2$Year, qx = lifetable2$val_norm,
+                law = "gompertz", fit.this.x = 60:105)
+
+
+# Confirm mortality laws are working accurately
+
+predict(mort_gen, x=c(60,80)) # start x for mort_gen was 20
+# #Makeham law formula A exp [Bx] + C
+# mort_gen$coef[["A"]] * exp(mort_gen$coef[["B"]]*(60 - 20 + 1)) + mort_gen$coef[["C"]]
+# mort_gen$coef[["A"]] * exp(mort_gen$coef[["B"]]*(80 - 20 + 1)) + mort_gen$coef[["C"]]
+
+# Kannisto-makeham A exp(Bx) / [1 + A exp(Bx)] + C 
+mort_gen$coef[["A"]] * exp(mort_gen$coef[["B"]]*(60-20+1)) / (1 + mort_gen$coef[["A"]]* exp(mort_gen$coef[["B"]]*(60-20+1))) + mort_gen$coef[["C"]]
+mort_gen$coef[["A"]] * exp(mort_gen$coef[["B"]]*(80-20+1)) / (1 + mort_gen$coef[["A"]]* exp(mort_gen$coef[["B"]]*(80-20+1))) + mort_gen$coef[["C"]]
+
+predict(mort_reg, x=c(60,80))  # start x for mort_reg was 60
+flexsurv::hgompertz(60-60+1, shape = mort_reg$coef[[2]], rate = mort_reg$coef[[1]]) 
+flexsurv::hgompertz(80-60+1, shape = mort_reg$coef[[2]], rate = mort_reg$coef[[1]]) 
+#Gompertz law formula A exp[Bx]
+mort_reg$coef[[1]]* exp(mort_reg$coef[[2]]*(60-60+1))
+mort_reg$coef[[1]]* exp(mort_reg$coef[[2]]*(80-60+1))
+xyears<-c(seq(60,100, 1))
+plot(xyears, predict(mort_reg, x = 60:100), type = "l", col = "black", xlab = "Years", ylab = "Hazard rate")
+lines(xyears, predict(mort_gen, x = 60:100), col = "red")
+m1<-predict(mort_reg, x = 60:100) # Hazard Rates
+m2<-predict(mort_gen, x = 60:100)
+
+rm("lifetable", "lifetable2", "lifetable_old")
+
+#save(list = c("mort_gen", "mort_reg"), file = paste0(filepath, "/ChapterTwo/mort2.Rdata"))
+
+```
+
+```{r Global simulation parameters and vars, include = FALSE}
+
+load(file = paste0(filepath, "/ChapterTwo/mort2.Rdata"))
+
+# Create number of replications (nsim), sample sizes of each replications, population size
+n_sim <- 1000
+n_obs <- c(30, 60, 90, 120, 250, 500)
+n <- 50000
+
+# Set scenario number
+scens <- 4
+
+
+scen <- 4  
+
+
+# Set seed
+seed <- 39873
+set.seed(seed)
+
+
+# Define new functions
+
+se <- function(x) {sd(x, na.rm = TRUE) * sqrt(1 / n_sim)}
+
+# Set distributions
+
+distribs <- list("exponential", "weibull", "llogis", "lnorm", "gompertz", "gengamma" )
+
+# Output filetype for figures
+
+filetype <- "png"
+
+# General population mortality
+
+genpop_times <- flexsurv::rgompertz(1000000, shape = mort_reg$coefficients[2],rate = mort_reg$coefficients[1])
+genpop_status <- rep(1, length(genpop_times))
+genpop_reg <- flexsurvreg(Surv(genpop_times, genpop_status) ~ 1, dist = "gompertz")
+genpop_reg
+
+# genpop_times <- flexsurv::rgompertz(1000000, shape = mort_gen$coefficients[2],rate = mort_gen$coefficients[1])
+# genpop_status <- rep(1, length(genpop_times))
+# genpop<-as.data.frame(cbind(times = genpop_times, status = genpop_status))
+# genpop$age <- rnorm(n = length(genpop_times), mean = 60, sd = 15)
+# genpop$newtimes <- genpop$times - (genpop$age)
+# genpop <- filter(genpop, newtimes >0)
+# pop_reg <- flexsurvreg(Surv(newtimes, status) ~ age, dist = "gompertz", data = genpop)
+
+
+# Save setup parameters
+
+#save(list = ls(), file = paste0(filepath, "/ChapterTwo/setup.Rdata"))
+```
+
+## Population simulation setup
+
+Data for each scenario were simulated from a five-state model: an event time from initial state pre-trial entry to study enrollment in the progression-free state, followed by the events of progression, death from other causes, or death due to disease. Patients could reach either death state from progression-free and progression states, but only death due to disease from the progression state. 
+
+A transition intensity matrix was created with forward transition intensity functions: 
+$\lambda_{01}:$ Uniform distribution, using time to transition approach to control maximum accrual time.
+$\lambda_{12}:$ Exponential distribution for progression.
+$\lambda_{23}:$ Exponential distribution for disease-related mortality.
+$\lambda_{24}, \lambda_{34}:$ Gompertz distribution from life-tables for death due to other causes (age-related mortality), with added mortality (HR mortality).
+
+The following chunk sets up the number of scenarios, parameters for each population scenario and sets up the matrix.
+
+```{r initial simulation setup, eval=FALSE, include=FALSE}
+  
+  # load(file = paste0(filepath, "/ChapterTwo/setup.Rdata"))
+   
+  # Set up parameters 
+  bl <- data.table(
+    id = 1:n,
+    age = rnorm(n, mean = 60, sd = 6))
+  
+ params <- tibble(
+        t1 =  rep(18 / 12, scens),
+        f23 = rep("Weibull", scens),
+        f35 = rep("Weibull", scens),
+        shape23= c(1, 1.6, 0.4, 0.4),
+        scale23 = c(1/0.5, 1/0.5, 1/0.5, 1/0.1),
+        A = rep(mort_gen$coef[["A"]], scens),
+        B = rep(mort_gen$coef[["B"]], scens),
+        C = rep(mort_gen$coef[["C"]],scens),
+        shape35 = c(1, 1.6, 1.6, 1.6),
+        scale35 = c(1/0.2, 1/0.2, 1/0.2, 1/0.1))
+
+  
+  # Set up states, transition matrix, transition functions
+  
+  states <- 5     
+  tmat <- transMat(x = list(c(2), c(3,4), c(4,5), c(), c()),
+                   names = c("Pre-trial","PFS","PD", "DeadOther", "DeadDx"))   
+  
+  prepcohort <- function(t1, f23, f35, shape23, scale23, A, B, C, shape35, scale35){  
+    hf <- generateHazardMatrix(states)                                            
+    hf[[1,2]] <- function() runif(length(n), 0, t1) 
+    hf[[2,3]] <- f23
+    # hf[[2,4]] <- hf[[3,4]]<- function(t, mortshape, mortrate, mortbage) {
+    #   flexsurv::hgompertz(t, shape = mortshape, rate = exp(rep(mortrate, length(t)) + mortbage * bl[["age"]])) 
+    #   }   # Gompertz
+    # hf[[2,4]] <- hf[[3,4]]<- function(t, A, B, C){
+    #    A * exp(B*(t + bl[["age"]] - 20)) + C
+    # } # Makeham A exp(Bx) + C
+    hf[[2,4]] <- hf[[3,4]]<- function(t, A, B, C){ 
+       (A * exp(B * (t + bl[["age"]] - 20 + 1)) / (1 + A * exp(B*(t + bl[["age"]] - 20 + 1))) + C)
+    } # Kannisto Makeham law:  A exp(Bx) / [1 + A exp(Bx)] + C   
+    hf[[3,5]] <- f35
+
+        par <- generateParameterMatrix(hf)
+    par[[1,2]] <- list()
+    par[[2,3]] <- list(shape = shape23, scale = scale23)
+    # par[[2,4]] <- par[[3,4]] <- list(mortshape = mortshape,
+    #                                  mortrate = mortrate,
+    #                                  mortbage = mortbage)
+    par[[2,4]] <- par[[3,4]] <- list(A = A, B = B, C = C)
+    par[[3,5]] <- list(shape = shape35, scale = scale35)
+
+    # cov <-generateParameterCovarianceMatrix(par)
+    # cov[[2,4]] <- cov[[3,4]] <- pop_vcov
+    
+  
+    ttt <- matrix(FALSE, nrow = 5, ncol = 5)
+    ttt[1, 2] <- TRUE
+  
+    cohort <- simulateCohort(transitionFunctions = hf, 
+                             parameters = par, 
+                             #parameterCovariances = cov,
+                             cohortSize = n, 
+                             timeToTransition = ttt, 
+                             baseline = bl, 
+                             to = 100)
+  }
+  
+  cohort <- mlply(params, prepcohort)
+
+  save(list = c("cohort"), file = paste0(filepath, "/ChapterTwo/cohort-final.Rdata"))
+
+
+```
+
+The simulation included `r n` individuals in the population. For reproducibility of the simulation, the seed was set to `r seed`. 
+
+## Cohort data prep
+
+To simulate the data like a clinical trial dataset, enrollment, progression and death times were rounded to the nearest day, with enrollment rounded down and latter two rounded up to ensure all event times > 0. If progression and death occurred within the same day, the death event took precedence. Event times for both types of deaths (disease or other) were combined, since the cause of death is not likely to be known in the data.
+
+The data were prepared into long format to analyze each transition separately, with the accrual transition discarded for the analysis of the remaining multistate model or to analyze time to-event data with PFS or OS endpoints.
+
+The following chunk rearranges and prepares the data for analysis.
+
+```{r Data prep for full cohort, eval= FALSE, include=FALSE}
+
+# Create trial dataframe, set times to integers, status = 1 for true cohort
+# if progressed and dead within the same day, set as dead and status = 0 for progression
+# Set up dataframe to collect enrollment, PFS and OS times.
+
+load(file = paste0(filepath, "/ChapterTwo/cohort-final.Rdata"))
+
+ms_pop_surv <- llply(1:scens, function(i){
+  data <- as.data.frame(cohort[[i]]@time.to.state)
+  
+  names(data) <- c("pre-trial", "pfs", "pd", "deadother", "deaddx")
+  data$dead <- ifelse(is.na(data$deaddx), data$deadother, data$deaddx)
+  
+  tmat <- transMat(x = list(c(2), c(3,4), c(4), c()),
+                 names = c("Pre-trial","PFS","PD", "Dead"))   
+  
+  pop_times <- matrix(c(rep(NA,n), 
+                      data$pfs, 
+                      ifelse(is.na(data$pd),
+                             data$dead,
+                             ifelse(data$pd == data$dead, 
+                                    data$dead,
+                                    data$pd)), 
+                      data$dead), n, 4)        
+  pop_status <- matrix(c(rep(NA,n), 
+                         rep(1, n), 
+                         ifelse(is.na(data$pd), 0,
+                                ifelse(data$pd == data$dead, 
+                                       0, 1)), 
+                         rep(1,n)), n, 4) 
+  ms_pop <- msprep(time = pop_times, status = pop_status, trans = tmat) %>% nest_by(id)
+  cohort_times <- data %>% 
+                  mutate(id = seq(1, n)) %>% 
+                  rowwise(id) %>% 
+                  transmute(tenrolled = pfs, 
+                            tpfs = min(pd, dead, na.rm = TRUE),
+                            tos = dead,
+                            time_pfs = tpfs - tenrolled,
+                            time_os = tos - tenrolled,
+                            status_pfs = 1,
+                            status_os = 1) %>% 
+    ungroup() %>% 
+    as.data.frame()
+  ms_pop_surv2 <- merge(ms_pop, cohort_times, by = "id")
+})
+
+
+#save(list = c("ms_pop_surv"), file = paste0(filepath, "/ChapterTwo/surv-final.Rdata"))
+
+```
+
+## Population survival analysis
+
+The following chunk analyzes the full population data with KM curves for PFS and OS, plots population PFS and OS, fits parametric models and  saves RMST from best-fitting PFS and OS curves. 
+Then fits transition-specific parametric models to the data to generate a multi-state model and estimates survival from the multistate model.
+
+```{r Analysis: Population, warning=FALSE, echo=FALSE}
+# 
+#  load(file = paste0(filepath, "/ChapterTwo/setup.Rdata"))
+  load(file = paste0(filepath, "/ChapterTwo/surv-final.Rdata"))
+
+# Fit KM curves to PFS and OS, set up population values
+
+ms_pop_surv2 <-ms_pop_surv[[scen]]
+
+pop_pfs <- survfit(Surv(time_pfs, status_pfs) ~ 1, data = ms_pop_surv2)
+#plot(pop_pfs)
+
+pop_os <- survfit(Surv(time_os, status_os) ~ 1, data = ms_pop_surv2)
+#plot(pop_os)
+
+horiz <- floor(quantile(pop_os, probs = c(0.99))[[1]])
+maxt <-  max(ms_pop_surv2$tos)  ## maximum time
+
+c_l       <- 1/12                    # cycle length (a month)
+n_t       <- horiz                   # number of years (20 years)
+times     <- seq(0, n_t, c_l)        # the cycles in years
+
+meanos <- survival:::survmean(pop_os, rmean = maxt)[[1]]["rmean"]
+meanpfs <- survival:::survmean(pop_pfs, rmean = maxt)[[1]]["rmean"]
+surv <- as.data.frame(cbind(meanos, meanpfs))
+surv$meanpd <- surv$meanos - surv$meanpfs
+surv$rmeanos <- survival:::survmean(pop_os, rmean = horiz)[[1]]["rmean"]
+surv$rmeanpfs <- survival:::survmean(pop_pfs, rmean = horiz)[[1]]["rmean"]
+surv$rmeanpd <- surv$rmeanos - surv$rmeanpfs
+print(surv)
+
+
+# plot(pop_pfs, col = "black", lty = 1, xlim = c(0, 40), xlab = "Time (years)", ylab = "Survival")
+# lines(pop_os, col = "red",  lty = 1)
+# legend("topright", legend = c("PFS", "OS"), lty=1:2, col = c("black", "red"))
+# title(paste0("Scenario ", scen))
+# 
+# library("muhaz")
+# fit_oshaz <- muhaz(ms_pop_surv2$time_os, ms_pop_surv2$status_os)
+# plot(fit_oshaz)
+
+# General population survival 
+
+os.surv.genpop <- 1 - flexsurv::pgompertz(times, shape = mort_reg$coefficients[2], rate = mort_reg$coefficients[1]) 
+
+# Fit parametric curves to PFS and OS
+
+fit_pfs <- list(model.objects = fit.models1(formula = Surv(time_pfs, status_pfs) ~ 1, 
+                                           distr = distribs, data = ms_pop_surv2))
+
+fit_pfs$bestfit <- set_names(list(fit_pfs$model.objects$models[[which.min(fit_pfs[["model.objects"]][["model.fitting"]][["aic"]])]]),
+                             names(fit_pfs$model.objects$models[which.min(fit_pfs[["model.objects"]][["model.fitting"]][["aic"]])]))
+
+# p <- surv_prob(fit_pfs$bestfit[[1]], t = times)
+# p1 <- p*os.surv.genpop
+# 
+# plot(x = times, y = p, col = "blue")
+# lines(x = times, y = p1, col = "green")
+# lines(x = times, y = os.surv.genpop, col = "yellow")
+# lines(fit_pfs$bestfit[[1]], col = "black")
+# lines(fit_pfs$bestfit[[1]], col = "red") 
+
+bhaz <- flexsurv::hgompertz(ms_pop_surv2$time_os, shape = mort_reg$coefficients[2], rate = mort_reg$coefficients[1]) 
+
+fit_os <-  list(model.objects = fit.models(formula = Surv(time_os,  status_os) ~ 1,
+                                           distr = distribs, data = ms_pop_surv2))
+
+fit_os_test <-  list(model.objects = fit.models1(formula = Surv(time_os,  status_os) ~ 1,
+                                           distr = distribs, data = ms_pop_surv2))
+
+fit_os$bestfit <- set_names(list(fit_os$model.objects$models[[which.min(fit_os[["model.objects"]][["model.fitting"]][["aic"]])]]),
+                            names(fit_os$model.objects$models[which.min(fit_os[["model.objects"]][["model.fitting"]][["aic"]])]))
+
+summary(fit_os$model.objects$models[[which.min(fit_os[["model.objects"]][["model.fitting"]][["aic"]])]], type = "rmst")
+summary(fit_os_test$model.objects$models[[which.min(fit_os_test[["model.objects"]][["model.fitting"]][["aic"]])]], type = "rmst")
+
+
+fit_os1 <-  list(model.objects = fit.models1(formula = Surv(time_os,  status_os) ~ 1, data = ms_pop_surv2, bhazard = bhaz, distr = distribs))
+
+fit_os1$bestfit <- set_names(list(fit_os1$model.objects$models[[which.min(fit_os1[["model.objects"]][["model.fitting"]][["aic"]])]]),
+                            names(fit_os1$model.objects$models[which.min(fit_os1[["model.objects"]][["model.fitting"]][["aic"]])]))
+
+summary(fit_os1$model.objects$models[[which.min(fit_os1[["model.objects"]][["model.fitting"]][["aic"]])]], type = "rmst")
+
+
+distribnames <- names(fit_os1[["model.objects"]][["models"]])
+
+# p <- surv_prob(fit_os1$model.objects$models[[which.min(fit_os1[["model.objects"]][["model.fitting"]][["aic"]])]], t = times)
+# p1 <- surv_prob(fit_os1$model.objects$models[[which.min(fit_os1[["model.objects"]][["model.fitting"]][["aic"]])]], t = times)*os.surv.genpop
+# plot(x = times, y = p, col = "blue")
+# lines(x = times, y = p1, col = "green")
+# lines(x = times, y = os.surv.genpop, col = "yellow")
+# lines(fit_os1$model.objects$models[[which.min(fit_os1[["model.objects"]][["model.fitting"]][["aic"]])]],
+#      col = "red", xlim = c(0,25), xlab = "Years", ylab = "Fitted survival curve (OS)")
+# lines(fit_os$model.objects$models[[which.min(fit_os[["model.objects"]][["model.fitting"]][["aic"]])]], col = "black")
+# 
+# haz <- as.data.table(summary(fit_os$model.objects$models[[which.min(fit_os[["model.objects"]][["model.fitting"]][["aic"]])]], type = "hazard"))
+# haz1 <- as.data.table(summary(fit_os1$model.objects$models[[which.min(fit_os1[["model.objects"]][["model.fitting"]][["aic"]])]], type = "hazard"))
+# plot(haz$time, haz$est, type = "l", xlim = c(0, max(times)), ylim = c(0, 0.6), col = "green", xlab = "Time", ylab = "Hazard", main = paste0("Scenario ", scen))
+# lines(haz1$time, haz1$est,  col = "red")
+# lines(times, hgompertz(times, shape = mort_reg$coefficients[2], rate = mort_reg$coefficients[1]), col = "blue")
+# lines(haz1$time, haz1$est + hgompertz(haz1$time, shape = mort_reg$coefficients[2], rate = mort_reg$coefficients[1]), col = "orange")
+# lines(fit_oshaz, col = "black")
+# 
+# 
+# legend("topleft", legend = c("fit to observed", "fit relative to baseline gpm", "baseline gpm", "total baseline + relative fit", "observed"), fill=c("green", "red", "blue", "orange", "black"))
+
+# Fit partitioned survival model
+
+v_names_states <- c("pfs", "pd", "dead")
+
+part <- partsurv_bhaz(pfs_survHE = fit_pfs, 
+                 os_survHE = fit_os1, 
+                 choose_PFS = names(fit_pfs$bestfit),
+                 choose_OS = names(fit_os1$bestfit),
+                 time = times,
+                 PA = TRUE,
+                 n_sim = 1000,
+                 v_names_states = v_names_states)
+
+part$pd.surv <- apply(part$os.surv, 2, function(x){
+  expected_surv(time = times, surv = x)}) - apply(part$pfs.surv, 2, function(x){
+  expected_surv(time = times, surv = x)})
+
+part$pd.expected.surv <- mean(part$pd.surv)
+
+part$pfs.expected.surv
+part$pd.expected.surv
+part$os.expected.surv
+
+part$pfs.expected.surv.ci <- quantile(apply(part$pfs.surv, 2, function(x){expected_surv(time = times, surv = x)}), c(0.025, 0.975))
+part$pd.expected.surv.ci <- quantile(part$pd.surv, c(0.025, 0.975))
+part$os.expected.surv.ci <- quantile(apply(part$os.surv, 2, function(x){expected_surv(time = times, surv = x)}), c(0.025, 0.975))
+
+part$pfs_curve <- names(fit_pfs$bestfit)
+part$os_curve <- names(fit_os1$bestfit)
+
+
+# Fit partitioned survival to observed without bhaz
+
+part1 <- partsurv(pfs_survHE = fit_pfs, 
+                 os_survHE = fit_os, 
+                 choose_PFS = names(fit_pfs$bestfit),
+                 choose_OS = names(fit_os$bestfit),
+                 time = times,
+                 PA = TRUE,
+                 n_sim = 1000,
+                 v_names_states = v_names_states)
+
+part1$pfs.expected.surv
+part1$os.expected.surv
+
+
+# part$pfs.surv.t <- apply(part$pfs.surv, 2, function(x){
+#   expected_surv(time = times, surv = x)})
+# part$os.surv.t <- apply(part$os.surv, 2, function(x){
+#   expected_surv(time = times, surv = x)})
+
+# CI 
+# pfs.expected.surv.sd <- sd(apply(part$pfs.surv, 2, function(x){expected_surv(time = times, surv = x)}))
+# os.expected.surv.sd  <- sd(apply(part$os.surv,  2, function(x){expected_surv(time = times, surv = x)}))
+# 
+# pfs <- c(part$pfs.expected.surv, 
+#          part$pfs.expected.surv - pfs.expected.surv.sd/sqrt(1000)*1.96,
+#          part$pfs.expected.surv + pfs.expected.surv.sd/sqrt(1000)*1.96)
+
+part_pop <- tibble(pfs = part$pfs.expected.surv, 
+                   pfs_ci = list(part$pfs.expected.surv.ci),
+                   pd = part$pd.expected.surv,
+                   pd_ci = list(part$pd.expected.surv.ci),
+                   os = part$os.expected.surv,
+                   os_check = sum(part$pfs.expected.surv, part$pd.expected.surv),
+                   os_ci = list(part$os.expected.surv.ci),
+                   pfs_dist = part$pfs_curve,
+                   os_dist = part$os_curve)
+part_pop
+  # parttrace <- as.matrix(part[["Mean"]])
+# 
+# plot(x = times, y = parttrace[,1], type = "l", col = "black", xlim = c(0, 25),
+# xlab = "Time (years)", ylab = "Survival", main = paste0("Scenario ", scen))
+# lines(x = times, y = 1- parttrace[,3], type = "l", col = "red")
+# abline(h = 0.5, lty = "dashed")
+# lines(x = times, y = os.surv.genpop, col = "blue")
+# legend("right", legend = c("pfs", "os", "general mortality"), fill=c("black", "red", "blue"))
+
+
+```
+
+```{r Population fitted multistate DES}
+
+distribnames <- names(fit_pfs[["model.objects"]][["models"]])
+
+ms_pop_surv_unnested <- ms_pop_surv2 %>% unnest(data)
+
+models <- llply(2:4, function (j){                             
+  models = set_names(map(seq_along(distribs),function(i){
+    tryCatch(flexsurvreg(Surv(time, status) ~ 1, dist = distribs[[i]], 
+                         data = subset(ms_pop_surv_unnested, trans == j)),
+             error = function(e) NA, warning = function(w) NA)}), distribnames)  
+  model.fitting = list(aic = c(laply(seq_along(distribs), function(i){
+    ifelse(is.na(models[i]), NA, models[[i]]$AIC)})),
+    bic = c(laply(seq_along(distribs), function(i){
+      ifelse(is.na(models[i]), NA, glance(models[[i]])$BIC)}))) 
+  return(list(model.objects = set_names(c(list(models), list(model.fitting)), "models", "model.fitting"))) 
+})  
+
+
+bhaztimesHD <- subset(ms_pop_surv_unnested, trans == 3)
+bhazHD <- flexsurv::hgompertz(bhaztimesHD$time, shape = mort_reg$coefficients[2], rate = mort_reg$coefficients[1])  
+
+modelHD <- llply(3, function (j){                             
+  models = set_names(map(seq_along(distribs),function(i){
+    tryCatch(flexsurvreg(Surv(time, status) ~ 1, dist = distribs[[i]], bhazard = bhazHD, 
+                         data = subset(ms_pop_surv_unnested, trans == j)),
+             error = function(e) NA, warning = function(w) NA)}), distribnames)  
+  model.fitting = list(aic = c(laply(seq_along(distribs), function(i){
+    ifelse(is.na(models[i]), NA, models[[i]]$AIC)})),
+    bic = c(laply(seq_along(distribs), function(i){
+      ifelse(is.na(models[i]), NA, glance(models[[i]])$BIC)}))) 
+  return(list(model.objects = set_names(c(list(models), list(model.fitting)), "models", "model.fitting"))) 
+}) 
+
+bhaztimesSD <- subset(ms_pop_surv_unnested, trans == 4)
+bhazSD <- flexsurv::hgompertz(bhaztimesSD$time, shape = mort_reg$coefficients[2], rate = mort_reg$coefficients[1])  
+pps <- survfit(Surv(bhaztimesSD$time, rep(1, length(bhaztimesSD$time)))~ 1)     
+
+
+modelSD <- llply(4, function (j){                             
+  models = set_names(map(seq_along(distribs),function(i){
+    tryCatch(flexsurvreg(Surv(time, status) ~ 1, dist = distribs[[i]], bhazard = bhazSD, 
+                         data = subset(ms_pop_surv_unnested, trans == j)),
+             error = function(e) NA, warning = function(w) NA)}), distribnames)  
+  model.fitting = list(aic = c(laply(seq_along(distribs), function(i){
+    ifelse(is.na(models[i]), NA, models[[i]]$AIC)})),
+    bic = c(laply(seq_along(distribs), function(i){
+      ifelse(is.na(models[i]), NA, glance(models[[i]])$BIC)}))) 
+  return(list(model.objects = set_names(c(list(models), list(model.fitting)), "models", "model.fitting"))) 
+}) 
+       
+
+## Fit DES
+
+# haz <- as.data.table(summary(test1[[3]]$model.objects$models[[which.min(test1[[3]]$model.objects$model.fitting$aic)]], type = "hazard"))
+# plot(haz$time, haz$est, type = "l", xlim = c(0, max(times)), ylim = c(0, 0.4), col = "red")
+# lines(times, hgompertz(times, shape = mort_reg$coefficients[2], rate = mort_reg$coefficients[1]), col = "black")
+# lines(haz$time, haz$est + hgompertz(haz$time, shape = mort_reg$coefficients[2], rate = mort_reg$coefficients[1]), col = "blue")
+# lines(test[[3]]$model.objects$models[[which.min(test[[3]]$model.objects$model.fitting$aic)]], type = "hazard",  col = "green")
+
+
+v_names_states_des <- c("pfs", "pd", "deadother", "deaddx")
+n_states  <- length(v_names_states_des)  # No of states 
+n_i       <- 10000                   # number of simulations 
+ # set.seed(seed)                       # set the seed
+
+m_P_diag_des <- matrix(NA, n_states, n_states, dimnames = list(v_names_states_des, v_names_states_des))
+m_P_diag_des["pfs", "pd"]  <- 1
+m_P_diag_des["pfs", "deadother"]  <- 2
+m_P_diag_des["pd" , "deadother"]  <- 3
+m_P_diag_des["pd" , "deaddx"]  <- 4
+
+m_P_diag_desbhaz <- matrix(NA, n_states, n_states, dimnames = list(v_names_states_des, v_names_states_des))
+m_P_diag_desbhaz["pfs", "pd"]  <- 1
+m_P_diag_desbhaz["pfs", "deadother"]  <- 2
+m_P_diag_desbhaz["pfs", "deaddx"]  <- 3
+m_P_diag_desbhaz["pd" , "deadother"]  <- 4
+m_P_diag_desbhaz["pd" , "deaddx"]  <- 5
+
+# Extract best fitting models
+# plot(test[[3]]$model.objects$models[[which.min(test[[3]]$model.objects$model.fitting$aic)]], col = "black", xlim = c(0,25), xlab = "Years", ylab = "Fitted survival curve (transition from pd to dead)")
+# lines(test1[[3]]$model.objects$models[[which.min(test1[[3]]$model.objects$model.fitting$aic)]], col = "red")
+
+bestfit_HSpop <- models[[1]]$model.objects$models[[which.min(models[[1]]$model.objects$model.fitting$aic)]]
+bestfit_HDpop <- models[[2]]$model.objects$models[[which.min(models[[2]]$model.objects$model.fitting$aic)]]
+bestfit_HDbhazpop <- modelHD[[1]]$model.objects$models[[which.min(modelHD[[1]]$model.objects$model.fitting$aic)]]
+bestfit_SDpop <- modelSD[[1]]$model.objects$models[[which.min(modelSD[[1]]$model.objects$model.fitting$aic)]]
+
+bestfit_HSdist <- names(models[[1]]$model.objects$models[which.min(models[[1]]$model.objects$model.fitting$aic)])
+bestfit_HDdist <- names(models[[2]]$model.objects$models[which.min(models[[2]]$model.objects$model.fitting$aic)])
+bestfit_HDbhazdist <- names(modelHD[[1]]$model.objects$models[which.min(modelHD[[1]]$model.objects$model.fitting$aic)])
+bestfit_SDdist <- names(modelSD[[1]]$model.objects$models[which.min(modelSD[[1]]$model.objects$model.fitting$aic)])
+
+
+list.mod <- list(bestfit_HSpop, bestfit_HDpop, genpop_reg, bestfit_SDpop)
+start <- Sys.time()
+DES_data <- totlos.simfs(list.mod, trans = m_P_diag_des, t = max(times), M=50000, B = 1000, ci = TRUE, group=c(1,2,3,3))
+Sys.time() - start
+DES_data <- as.data.frame(DES_data)
+DES_data
+
+list.modb <- list(bestfit_HSpop, genpop_reg, bestfit_HDbhazpop, genpop_reg, bestfit_SDpop)
+start <- Sys.time()
+DES_datab <- totlos.simfs(list.modb, trans = m_P_diag_desbhaz, t = max(times), M=50000, B = 1000, ci = TRUE, group=c(1,2,3,3))
+Sys.time() - start
+DES_datab <- as.data.frame(DES_datab)
+DES_datab
+
+
+DES_means <- ms_pop_surv_unnested %>% 
+  group_by(trans) %>% 
+  summarise(los = mean(time))
+
+DES_pop <- tibble(pfs = DES_data$est[[1]], 
+                pfs_ci = list(c(DES_data$L[[1]], DES_data$U[[1]])),
+                pd = DES_data$est[[2]],
+                pd_ci = list(c(DES_data$L[[2]], DES_data$U[[2]])),
+                os = max(times) - DES_data$est[[3]],
+                os_check = sum(DES_data$est[[1]], DES_data$est[[2]]),
+                os_ci = list(c(max(times) - DES_data$U[[3]], max(times) - DES_data$L[[3]])),
+                hs_dist = bestfit_HSdist,
+                hd_dist = bestfit_HDdist, 
+                sd_dist = bestfit_SDdist)
+print(DES_pop)
+surv
+
+
+
+ save(list = c("surv", "pps", "part_pop", "DES_pop", "horiz", "times", "os.surv.genpop", "part", "v_names_states", "v_names_states_des", "m_P_diag_des", "distribnames", "bestfit_HDdist", "bestfit_HSdist", "bestfit_SDdist"), file = paste0(filepath, "/ChapterTwo/", scen, "surv_pop-final2.Rdata"))
+ 
+
+
+```
+
+## Repetitions
+
+The following chunk sets up the total number of patients to pull for each repetition and makes random draws for each
+
+```{r Selecting samples, include=FALSE, eval=FALSE}
+# Set up total for each replication
+n_select <- sum(n_obs)
+
+# Create seq for level of n_obs, vector n_sim length for each s_size
+
+s_size <- ldply(1:length(n_obs), function(i){
+  data.frame(rep.int(n_obs[i], n_obs[i]))
+ })                                                                      
+s_size <- rep.int(s_size[,1], n_sim) 
+
+# Pull replications, merge with s_size to take each sequential number of rows
+
+cohort_select2 <- 
+  #llply(scens, function(i){
+    cbind(mdply(1:n_sim, function(x){
+    #ms_pop_surv[[i]] %>%  
+     ms_pop_surv2 %>% 
+        ungroup() %>% 
+        slice_sample(n = n_select)
+      }), 
+    s_size) 
+  #}) 
+
+# cohort_select2 <-llply(scens, function(i){
+#   dplyr::rename(cohort_select2[[i]], rep = X1)
+# })
+ cohort_select2 <- rename(cohort_select2, rep = X1) 
+
+# Output example data structure for scenario 1 for appendix 
+# slice(cohort_select2[[1]], 1:6)
+# cohort_select[[1]] %>%   select(scenario, everything())
+
+
+```
+
+
+## Sampling methods
+
+From the population, $n_{sim}$ repetitions were randomly sampled from the full population. To analyze the effects of different sizes for $n_{obs} = \{30,  60,  90,  120,  250,  500\}$, each of the $n_{sim}$ repetitions contained $sum(n_{obs}) = $`r n_select` patients and subsetted consecutively to select the appropriate sample size for each sample size level of $n_{obs}$ while ensuring independence across samples.
+
+In clinical trials where the time-to-event outcome is the primary outcome, the interim and final analyses are typically planned at the point of a specific number of events. For each repetition and each sample size, deciles of event times from the start of the study (study time) were estimated and used to create durations of follow-up times according to proportions of events experienced by the sample cohort. This produced a stacked dataset with the individuals in each repetition and sample size repeated with event or censoring times and censoring status from study enrollment for each level of $p_{e} = \{0.1, 0.2, \dots, 1\}$, proportion of events. For patients who have not enrolled by the study censor time corresponding to $p_e$, the patient event time was NA.  
+
+```{r Create censored datasets, include=FALSE, eval=FALSE}
+
+# For each combo of sim, s_size, and each decile of events (prop_e)
+# Estimate time in days for each decile of events, store each censoring time 
+# Calculate observed times in each decile, from enrollment
+# Set NA if study censor time < accrual time, and set status
+
+### Serial 
+
+# start <- Sys.time()
+
+# store <- ddply(cohort_select2, .(rep, s_size), function(x){
+#     prop_e <- seq(0.1, 1, 0.1)
+#     mdply(seq_along(prop_e), function(i){
+#       t_prop_e <- round(quantile(x$tpfs, probs = prop_e),0)
+#       t_c <- t_prop_e[[i]]
+#       tpfs_obs <- pmin(x$tpfs, t_c)
+#       time_pfs2 <- tpfs_obs - x$tenrolled
+#       time_pfs2 <- ifelse(time_pfs2 > 0, time_pfs2, NA)
+#       status_pfs2 <- ifelse(is.na(time_pfs2), NA, ifelse(x$tpfs > t_c, 0, 1))
+#       tos_obs <- pmin(x$tos, t_c)
+#       time_os2 <- tos_obs - x$tenrolled
+#       time_os2 <- ifelse(time_os2 > 0, time_os2, NA)
+#       status_os2 <- ifelse(is.na(time_os2), NA, ifelse(x$tos > t_c, 0, 1))
+#       prop_e <- prop_e[[i]]
+#       data.frame(
+#              cbind(x, prop_e, tpfs_obs, time_pfs2, status_pfs2, tos_obs, time_os2, status_os2))
+#       })
+#    })
+#  
+# Sys.time() - start
+
+
+start <- Sys.time()
+
+# Registering cores
+cores <- detectCores() - 1
+cl <- parallel::makeCluster(cores)
+registerDoParallel(cl)
+
+# Create data
+
+store <- ddply(cohort_select2, .(rep, s_size), function(x){
+    prop_e <- seq(0.1, 1, 0.1)
+    mdply(seq_along(prop_e), function(i){
+      t_prop_e <- quantile(x$tpfs, probs = prop_e, type = 3)
+      t_c <- t_prop_e[[i]]
+      tpfs_obs <- pmin(x$tpfs, t_c)
+      time_pfs2 <- tpfs_obs - x$tenrolled
+      time_pfs2 <- ifelse(time_pfs2 > 0, time_pfs2, NA)
+      status_pfs2 <- ifelse(is.na(time_pfs2), NA, ifelse(x$tpfs > t_c, 0, 1))
+      tos_obs <- pmin(x$tos, t_c)
+      time_os2 <- tos_obs - x$tenrolled
+      time_os2 <- ifelse(time_os2 > 0, time_os2, NA)
+      status_os2 <- ifelse(is.na(time_os2), NA, ifelse(x$tos > t_c, 0, 1))
+      prop_e <- prop_e[[i]]
+      data.frame(
+             cbind(x, prop_e, tpfs_obs, time_pfs2, status_pfs2, tos_obs, time_os2, status_os2))
+      })
+   }, .parallel = TRUE,
+    .paropts=list(.export=c('scen', 'cohort_select2'),
+                 .packages=c('tidyverse')))
+# Close connection
+stopCluster(cl)
+rm(cores)
+rm(cl)
+
+store <- store %>% 
+  rename(data_msm = data) %>% 
+  filter(prop_e > 0.2) 
+
+
+save(store, file = paste0(filepath,"/ChapterTwo/Scenario", scen, "/store-final2.Rdata"))
+Sys.time() - start
+
+# Output event time deciles example from Scenario 1 rep 1 sample size 30  for appendix on approach
+
+# quantile(head(cohort_select2, n=30)$tpfs, probs = seq(0.1, 1, 0.1), type = 3)
+
+# Output data structure example from scenario 1 rep 1 sample size 30 first three levels for appendix on approach
+
+# store %>% select(rep, id, from, to, trans, Tstart, Tstop, time, status, s_size, prop_e, t_obs, time2, status2) %>%  slice(1:6)
+# store %>% select(rep, id, from, to, trans, Tstart, Tstop, time, status, s_size, prop_e, t_obs, time2, status2) %>%  slice(31:36)
+
+
+```
+
+```{r set up censored data for msm, eval=FALSE}
+
+# load(file = paste0(filepath, "/ChapterTwo/Scenario", scen, "/store-final2.Rdata"))
+
+store_msm <- store %>% 
+  select(-X1) %>% 
+  unnest(data_msm) %>%
+  group_by(rep, s_size, prop_e) %>% 
+  filter(trans != 1) %>% 
+  mutate(tdead = tos_obs - tpfs_obs) %>% 
+  transmute(id,
+            trans,
+            time2 = case_when(trans == 4 ~ case_when(tdead > 0 ~ tdead),
+                              TRUE       ~ time_pfs2),
+            status2 = case_when(trans == 2 ~ case_when(status_pfs2 == 0      ~ status_pfs2,
+                                                       is.na(status_pfs2)    ~ status_pfs2,
+                                                       status == 0           ~ 0,
+                                                       time_pfs2 == time_os2 ~ 0,
+                                                       TRUE                  ~ 1),
+                                trans == 3 ~ case_when(status_pfs2 == 0      ~ 0,
+                                                       is.na(status_pfs2)    ~ status_pfs2,
+                                                       status == 0           ~ 0,
+                                                       time_pfs2 == time_os2 ~ 1,
+                                                       TRUE                  ~ 0),
+                                trans == 4 ~ case_when(is.na(time2)          ~ time2,
+                                                       status_os2 == 0       ~ 0,
+                                                       is.na(status_os2)     ~ status_os2,
+                                                       TRUE                  ~ 1),
+                                TRUE       ~ 1))
+
+
+save(list = c("store_msm"), file = paste0(filepath,"/ChapterTwo/Scenario", scen, "/store_msm-final2.Rdata"))
+rm(store_msm)
+
+
+
+```
+
+**Estimands and population targets** 
+
+The population quantities of interest 
+
+RMST was also estimated at the time horizon, $T_{2,i}$, when the extrapolated survival curves reached 1% for each simulated dataset, representing the approach used in modelling when the true time horizon is unknown. The target distribution, assessed by the proportion of repetitions selecting the true survival distribution (exponential) as best fitting, according to statistical goodness-of-fit using AIC, BIC and corrected AIC and BIC.
+
+**Analytic Methods**
+
+The true population and each simulated dataset $i = 1, \dots , n_{sim}$ were analyzed for each size of $n_{obs}$ and each decile of events $p_{e}$, by fitting a parametric survival curve using an exponential distribution. Estimated parametric model parameters were extracted for each target estimand. Other standard parametric distributions (Weibull, log-normal, log-logistic, generalized Gamma and Gompertz) were also  fit and the goodness-of-fit AIC measure extracted so that the proportion of simulations that select the true population distribution could also be estimated.Lastly, for repetitions where the best fitting distribution was not exponential, the model parameters were extracted for each target estimand from the best-fitting distribution.
+
+
+## Fit partsurv
+```{r fit normal partsurv}
+
+load(file = paste0(filepath, "/ChapterTwo/", scen, "surv_pop-final2.Rdata"))
+
+ load(file = paste0(filepath, "/ChapterTwo/Scenario", scen, "/store-final2.Rdata"))
+
+
+store1 <- store %>% 
+  select(-data_msm) 
+
+# Serial
+# 
+# start <- Sys.time()
+# store2 <- store1 %>%
+#   nest_by(rep, s_size, prop_e) %>%
+#   rowwise() %>%
+#   mutate(fit_part = fit_function_bhaz(data))
+# Sys.time() - start
+
+## Parallel
+
+start <- Sys.time()
+
+# Registering cores
+cores <- detectCores() - 1
+cluster <- tryCatch(new_cluster(cores), error = function(c) tryCatch(new_cluster(cores), error = function(c) new_cluster(cores)))
+cluster_library(cluster, c("darthtools", "abind", "purrr", "survHE"))
+cluster_copy(cluster, c("fit.models1", "format_output_fit.models1", "runMLE1", "manipulate_distributions", "trans_prob", "fit_function_part", "times", "distribs", "make_KM", "expected_surv", "v_names_states", "partsurv_bhaz", "os.surv.genpop", "mort_reg", "is_na", "check_distributions", "load_availables", "make.surv1", "args_surv", "compute_surv_curve",
+                        "make_profile_surv", "make_sim_mle", "partsurv_nobhaz"))
+
+store_part <- store1 %>%
+nest_by(rep, s_size, prop_e) %>%
+rowwise() %>%
+partition(cluster)
+
+store2 <- store_part %>%
+mutate(fit_part = fit_function_part(data, PA = TRUE, n_sim = 1000)) %>%
+collect()  
+# Close connection
+rm(store_part)
+rm(cluster)
+rm(cores)
+
+Sys.time() - start
+ 
+
+analysis <- "part"
+saveRDS(store2, file = paste0(filepath,"/ChapterTwo/Scenario", scen,  "/store-final2", analysis, ".RDS"))
+     
+
+
+```
+
+## Fit MSM with DES
+```{r fit des}
+load(file = paste0(filepath, "/ChapterTwo/", scen, "surv_pop-final2.Rdata"))
+load(file = paste0(filepath, "/ChapterTwo/Scenario", scen, "/store_msm-final2.Rdata"))
+
+
+# set up data
+
+store_msm3 <- store_msm %>%
+  group_by(rep, s_size, prop_e) %>% 
+  pivot_wider( names_from=trans, values_from=c(time2, status2)) %>%
+  ungroup() %>% 
+  nest_by(rep, s_size, prop_e)
+
+## Parallel
+
+start <- Sys.time() 
+
+cores <- detectCores() - 1
+cluster <- tryCatch(new_cluster(cores), error = function(c) tryCatch(new_cluster(cores), error = function(c) new_cluster(cores)))
+cluster_library(cluster, c("flexsurv", "plyr", "purrr"))
+cluster_copy(cluster, c("distribs", "distribnames", "genpop_reg", "fit_function_des", "m_P_diag_des", "m_P_diag_desbhaz", "times", "is_na", "v_names_states_des","mort_reg"))
+
+
+store_despart <- store_msm3 %>% 
+  rowwise() %>% 
+  partition(cluster)
+
+store_des <- store_despart %>% 
+  mutate(fit_des = list(fit_function_des(data, B1 = 1000, B2 = 1000))) %>% 
+  collect()
+
+#    Close connection
+rm(store_despart)
+rm(cluster)
+rm(cores)
+    
+analysis <- "des" 
+saveRDS(store_des, file = paste0(filepath,"/ChapterTwo/Scenario", scen,  "/store-final2", analysis, ".RDS"))
+Sys.time() - start
+
+ 
+```
+
+## Assess performance
+**Performance measures**
+
+In order to assess the performance of the extrapolation under various conditions of the data collection process, the coverage and error for each of the estimands were evaluated across the simulations. Firstly, any failed analyses were recorded as missing values, together with reasons if possible. To describe the cohort, the average proportion of the target sample size accrued at each level of events were calculated. With respect to performance in targetting the population quantities of interest, $x$, which include the fitted hazard rate, median survival, landmark one-year survival probability, and restricted mean survival times (RMST), the following key measures will be used: 
+
+Selecting best fitting curve - the proportion of repetitions for which the AIC from a parametric survival model using an exponential distribution is lowest among the fitted distributions $$ Best fitting = Pr(AIC_{exp,i} = min(AIC_{dist,i})), $$
+$$ dist = \{exponential, Weibull,lognormal, loglogistic, generalized Gamma, Gompertz\} $$. 
+
+Coverage - the proportion of repetitions in the simulation whose confidence intervals contain the true population quantity.  $$Coverage = Pr(\hat{x}_{low,i} < x < \hat{x}_{upp,i})$$
+
+Error: 
+a) Mean absolute error (MAE) - the degree to which the estimates from each replication, $\hat{x}_i$, differs from the true population fitted quantities, $x$, in absolute terms, for each combination of sample size and follow-up time in the simulation. $$MAE = \frac{1}{n_{sim}}\sum_{n=1}^{n_{sim}}|\hat{x}_i-x|$$
+
+b) Mean absolute percentage error (MAE) - the degree to which the estimates from each replication, $\hat{x}_i$, differs from the true population fitted quantities, $x$, in either direction, as a percentage of the true value, for each combination of sample size and follow-up time in the simulation. $$MAPE = \frac{1}{n_{sim}}\sum_{n=1}^{n_{sim}}\frac{|\hat{x}_i-x|}{x}$$
+
+c)Root mean squared error (RMSE) - the root of the mean squared error between each replication and the true population fitted quantity. $$RMSE = \sqrt{\frac{1}{n_{sim}}\sum_{n=1}^{n_{sim}}(\hat{x}_i-x)^2}$$
+
+d) Probability of 20% error - the proportion of repetitions that produced estimates >20% from true value $$\text{Probability of 20% error} = \frac{1}{n_{sim}}\sum_{n=1}^{n_{sim}}1(\frac{|\hat{x}_i-x|}{x} > 20\%)$$
+
+To assess these measures, the fitted rates, medians, survival probabilities and RMST and their CIs were extracted for each repetition in the simulation. The following chunk conducts rowwise parametric survival analysis for combination of sample size and follow-up, "grouping", for each repetition. The analysis is conducted in parallel for efficiency.
+
+The MAE, MAPE, RMSE, difference >20% and coverage were assessed for each grouping. 
+The following chunk evaluates each repetition grouping's coverage (CI includes estimand y/n) and error (magnitude of ae, ape, >20% y/n) for each estimand.
+
+
+```{r Calculate performance measures for partnorm, eval=FALSE, include=FALSE}
+
+    
+llply(c("part"), function(z){
+
+    store2 <- readRDS(file = paste0(filepath,"/ChapterTwo/Scenario", scen,  "/store-final", z, ".RDS"))
+    
+    #type <- "aicc"
+    
+    llply(c("aicc", "bicc"), function(i){
+    
+      unnested <- store2 %>% unnest_wider(fit_part) %>% unnest_wider(i) 
+      
+      means <-unnested %>% 
+        group_by(s_size, prop_e) %>% 
+        dplyr::summarise(mean_pfs = mean(pfs, na.rm = TRUE),
+                         mean_pd = mean(pd, na.rm = TRUE),
+                         mean_os = mean(os, na.rm = TRUE)) %>% 
+        pivot_longer(starts_with("mean"),
+                     names_to = c(".value", "category"),
+                     names_pattern = "(.+)_(.+)")
+      write_csv(as.data.frame(means), file = paste0(filepath, "/ChapterTwo/tables/meanresults-final", i , scen, z,".csv"))
+      
+      popsurv <-tibble(category = c("pfs", "pd", "os"), pop =c(surv$rmeanpfs, surv$rmeanpd, surv$rmeanos))
+      write_csv(as.data.frame(popsurv), file = paste0(filepath, "/ChapterTwo/tables/popresults-final", scen,".csv"))
+      
+      count_failed <- unnested %>%
+        mutate(flag_error = ifelse(is.na(pfs), 1, 0)) %>% 
+        group_by(s_size, prop_e) %>% 
+        summarize(count = sum(flag_error),
+                  percent = count/n(),
+                  .groups = "keep")
+      unnested <- unnested %>%
+        filter(!is.na(pfs)) %>% 
+        rowwise() %>%
+        mutate(cover_pfs = ifelse((pfs_ci[[1]]< surv$rmeanpfs &
+                                  surv$rmeanpfs < pfs_ci[[2]]), 1, 0),
+               cover_pd = ifelse((pd_ci[[1]] < surv$rmeanpd &
+                                  surv$rmeanpd < pd_ci[[2]]), 1, 0),
+               cover_os = ifelse((os_ci[[1]] < surv$rmeanos &
+                                  surv$rmeanos < os_ci[[2]]), 1, 0),
+               e_pfs = ae(surv$rmeanpfs, pfs),
+               e_pd = ae(surv$rmeanpd, pd),
+               e_os = ae(surv$rmeanos, os),
+               pe_pfs = ape(surv$rmeanpfs, pfs),
+               pe_pd = ape(surv$rmeanpd, pd),
+               pe_os = ape(surv$rmeanos, os),
+               prop20_pfs = ifelse(e_pfs/surv$rmeanpfs > 0.2, 1, 0),
+               prop20_pd = ifelse(e_pd/surv$rmeanpd > 0.2, 1, 0),
+               prop20_os = ifelse(e_os/surv$rmeanos > 0.2, 1, 0),
+               # propcurve_pfs = ifelse(pfs_dist == part$pfs_curve, 1, 0),
+               # propcurve_os = ifelse(os_dist == part$os_curve, 1, 0),
+               prop_e_os = os_events/s_size,
+               prop_obs_pfs = pfs_obs/pfs,
+               prop_obs_pd = pd_obs/pd,
+               prop_obs_os = os_obs/os,
+               width_pfs = pfs_ci[[2]] - pfs_ci[[1]],
+               width_pd = pd_ci[[2]] - pd_ci[[1]],
+               width_os = os_ci[[2]] - os_ci[[1]])
+      
+      results <- unnested %>% 
+        group_by(s_size, prop_e) %>% 
+        summarise(
+          across(starts_with("cover"), mean), 
+          across(starts_with("width"), mean), 
+          across(starts_with("e"), list(ma = mean), .names="{fn}{col}"), 
+          across(starts_with("pe"), list(ma = mean), .names="{fn}{col}"),
+          se_mae_pfs = se(pfs),
+          se_mae_pd = se(pd),
+          se_mae_os = se(os),
+          se_mape_pfs = se(pfs)/surv$rmeanpfs,
+          se_mape_pd = se(pd)/surv$rmeanpd,
+          se_mape_os = se(os)/surv$rmeanos,
+          across(starts_with("prop20"), mean), 
+          across(starts_with("propcurve"), mean),
+          across(starts_with("prop_e_"), mean),
+          across(starts_with("prop_obs"), mean),
+                          .groups = "keep") %>% 
+        ungroup()
+      
+      # Create long data for faceted plots 
+      results2 <- results %>% 
+          pivot_longer(c(starts_with("mae"), 
+                         starts_with("mape"),
+                         starts_with("se_mae"),
+                         starts_with("se_mape"),
+                         starts_with("cover"),
+                         starts_with("width"),
+                         starts_with("prop20"),
+                         starts_with("prop_obs")),
+                       names_to = c(".value", "category"),
+                       names_pattern = "(.+)_(.+)")
+      
+      # Calculate rmse and its se
+      
+      pop_row <- as.data.frame(cbind(pop_pfs = surv$rmeanpfs, pop_pd = surv$rmeanpd, pop_os = surv$rmeanos))
+      pop_row <- as.data.frame(lapply(pop_row, rep, times = nrow(unnested))) 
+      
+      meas <- c("pfs", "pd", "os")
+      
+      resultsrmse <- ldply(seq_along(meas),function(i) {
+        unnested %>%
+          cbind(pop_row) %>%
+          group_by(s_size, prop_e) %>%
+          do(calc_absolute(.,
+                           estimates = paste0(meas[[i]]),
+                           true_param = paste0("pop_", meas[[i]]),
+                           perfm_criteria = c("bias","rmse")))  %>%
+          cbind(., param = meas[[i]])
+      })
+       
+       resultsrmse <- resultsrmse %>%
+         pivot_wider(names_from = param, values_from = c(bias, bias_mcse, rmse, rmse_mcse))
+       
+      resultsrmse2 <- resultsrmse %>%
+        pivot_longer(c(starts_with("rmse"),
+                       starts_with("bias"),
+                     starts_with("rmse_mcse"),
+                     starts_with("bias_mcse")),
+                     names_to = c(".value", "category"),
+                     names_pattern = "(.+)_(.+)")
+      
+      results2 <- full_join(results2, resultsrmse2)
+      
+      write_csv(as.data.frame(results2), file = paste0(filepath, "/ChapterTwo/tables/results-final", i, scen, z,".csv"))
+      }
+    )
+ }
+)
+
+```
+
+```{r calculate performance measures for des norm results,eval=FALSE, include=FALSE}
+
+#analysis <- "descsimp"
+
+llply(c("desc", "descsimp"), function(z){
+  
+    store_des <- readRDS(file = paste0(filepath,"/ChapterTwo/Scenario", scen,  "/store-final", z, ".RDS"))
+    
+    #type <- "bicc"
+    
+    llply(c("aicc", "bicc"), function(i){
+    
+    unnested <- store_des %>% 
+      mutate(des = unlist(fit_des, recursive = F)) %>% 
+      unnest_wider(des) %>% 
+      unnest_wider(i)
+    head(unnested)
+    
+    count_failed <- unnested %>%
+      mutate(flag_error = ifelse(is.na(pfs), 1, 0)) %>% 
+      group_by(s_size, prop_e) %>% 
+      summarize(count = sum(flag_error),
+                percent = count/n(),
+                .groups = "keep")
+    
+       
+    p1 <- ggplot(count_failed, aes(x = prop_e,
+                             y = percent,
+                             group = s_size,
+                             color = as.factor(s_size))) +
+            geom_line() +
+            labs(title = c(paste0("Scenario ", scen, ": Proportion of repetitions with at least one MSM transition that fails to converge")),
+                 color = "Sample size",
+                 x = "Proportion of PFS events",
+                 y = "Proportion of repetitions ") +
+            scale_x_continuous(breaks = seq(0, 1, 0.2)) +
+            ylim(c(0, 1)) +
+            theme_classic()
+    p1
+    ggsave(file = paste0(filepath, "/ChapterTwo/figures/plotcount_failed", scen, i, z, ".", filetype),
+           p1, width = 10, height = 7, units = "in", dpi = 300)
+      
+    means <- unnested %>% 
+      group_by(s_size, prop_e) %>% 
+      dplyr::summarise(mean_pfs = mean(pfs, na.rm = TRUE),
+                       mean_pd = mean(pd, na.rm = TRUE),
+                       mean_os = mean(os, na.rm = TRUE)) %>% 
+      pivot_longer(starts_with("mean"),
+                   names_to = c(".value", "category"),
+                   names_pattern = "(.+)_(.+)")
+    
+    write_csv(as.data.frame(means), file = paste0(filepath, "/ChapterTwo/tables/meanresults-final", i, scen, z,".csv"))
+    
+    popsurv <-tibble(category = c("pfs", "pd", "os"), pop =c(surv$rmeanpfs, surv$rmeanpd, surv$rmeanos) )
+    
+    head(unnested)
+    
+    
+    dlookup <- cbind(distribs, distribnames)
+    
+    unnested <- unnested %>%
+      filter(!is.na(pfs)) %>% 
+      rowwise() %>%
+      mutate(cover_pfs = ifelse((pfs_ci[[1]] < surv$rmeanpfs &
+                                surv$rmeanpfs < pfs_ci[[2]]), 1, 0),
+             cover_pd = ifelse((pd_ci[[1]] < surv$rmeanpd &
+                                surv$rmeanpd < pd_ci[[2]]), 1, 0),
+             cover_os = ifelse((os_ci[[1]] < surv$rmeanos &
+                                surv$rmeanos < os_ci[[2]]), 1, 0),
+             e_pfs = ae(surv$rmeanpfs, pfs),
+             e_pd = ae(surv$rmeanpd, pd),
+             e_os = ae(surv$rmeanos, os),
+             pe_pfs = ape(surv$rmeanpfs, pfs),
+             pe_pd = ape(surv$rmeanpd, pd),
+             pe_os = ape(surv$rmeanos, os),
+             prop20_pfs = ifelse(e_pfs/surv$rmeanpfs > 0.2, 1, 0),
+             prop20_pd = ifelse(e_pd/surv$rmeanpd > 0.2, 1, 0),
+             prop20_os = ifelse(e_os/surv$rmeanos > 0.2, 1, 0),
+             width_pfs = pfs_ci[[2]] - pfs_ci[[1]],
+             width_pd = pd_ci[[2]] - pd_ci[[1]],
+             width_os = os_ci[[2]] - os_ci[[1]])
+    
+    head(unnested)
+    
+    results <- unnested %>% 
+      group_by(s_size, prop_e) %>% 
+      summarise(
+        across(starts_with("cover"), mean), 
+        across(starts_with("width"), mean), 
+        across(starts_with("e"), list(ma = mean), .names="{fn}{col}"), 
+        across(starts_with("pe"), list(ma = mean), .names="{fn}{col}"),
+        se_mae_pfs = se(pfs),
+        se_mae_pd = se(pd),
+        se_mae_os = se(os),
+        se_mape_pfs = se(pfs)/surv$rmeanpfs,
+        se_mape_pd = se(pd)/surv$rmeanpd,
+        se_mape_os = se(os)/surv$rmeanos,
+        across(starts_with("prop20"), mean), 
+        across(starts_with("propcurve"), mean),
+                        .groups = "keep") %>% 
+      ungroup()
+    
+    # Create long data for faceted plots 
+    results2 <- results %>% 
+        pivot_longer(c(starts_with("mae"), 
+                       starts_with("mape"),
+                       starts_with("se_mae"),
+                       starts_with("se_mape"),
+                       starts_with("cover"),
+                       starts_with("width"),
+                       starts_with("prop20")),
+                     names_to = c(".value", "category"),
+                     names_pattern = "(.+)_(.+)")
+    
+    
+    # Calculate rmse and its se
+    
+    pop_row <- as.data.frame(cbind(pop_pfs = surv$rmeanpfs, pop_pd = surv$rmeanpd, pop_os = surv$rmeanos))
+    pop_row <- as.data.frame(lapply(pop_row, rep, times = nrow(unnested))) 
+    
+    meas <- c("pfs", "pd", "os")
+    
+    resultsrmse <- ldply(seq_along(meas),function(i) {
+      unnested %>%
+        cbind(pop_row) %>%
+        group_by(s_size, prop_e) %>%
+        do(calc_absolute(.,
+                         estimates = paste0(meas[[i]]),
+                         true_param = paste0("pop_", meas[[i]]),
+                         perfm_criteria = c("bias", "rmse")))  %>%
+        cbind(., param = meas[[i]])
+    })
+     
+     resultsrmse <- resultsrmse %>%
+       pivot_wider(names_from = param, values_from = c(bias, bias_mcse, rmse, rmse_mcse))
+     
+    resultsrmse2 <- resultsrmse %>%
+      pivot_longer(c(starts_with("rmse"),
+                   starts_with("rmse_mcse"),
+                   starts_with("bias"),
+                   starts_with("bias_mcse")),
+                   names_to = c(".value", "category"),
+                   names_pattern = "(.+)_(.+)")
+    
+    results2 <- full_join(results2, resultsrmse2)
+    
+    # rm(resultsrmse)
+    # rm(resultsrmse2)
+    write_csv(as.data.frame(results2), file = paste0(filepath, "/ChapterTwo/tables/results-final", i, scen, z,".csv"))
+      }
+    )
+  }
+)
+
+```
+
+```{r calculate performance measures for all results at once}
+
+## Load the datasets
+
+load(file = paste0(filepath, "/ChapterTwo/", scen, "surv_pop-final2.Rdata"))
+type <- "aicc"
+
+part <- readRDS(file = paste0(filepath,"/ChapterTwo/Scenario", scen,  "/store-final2part.RDS")) %>% 
+  unnest_wider(fit_part) %>% 
+  unnest_wider(type) %>% 
+  select(-data)
+
+des <- readRDS(file = paste0(filepath,"/ChapterTwo/Scenario", scen,  "/store-final2desfinal.RDS")) %>%   
+   mutate(des = unlist(fit_des, recursive = F)) %>% 
+  unnest_wider(des) %>% 
+  unnest_wider(type) %>% 
+  select(-data)
+
+
+popsurv <-tibble(category = c("pfs", "pd", "os"), pop =c(surv$rmeanpfs, surv$rmeanpd, surv$rmeanos))
+
+part <- part %>%
+   rename(pfs.NaivePSM = pfs_s,
+          pfs_ci.NaivePSM = pfs_ci_s,
+          pd.NaivePSM = pd_s,
+          pd_ci.NaivePSM = pd_ci_s,
+          os.NaivePSM = os_s,
+          os_ci.NaivePSM = os_ci_s,
+          pfs.PSMwithGPM = pfs,
+          pfs_ci.PSMwithGPM = pfs_ci,
+          pd.PSMwithGPM = pd,
+          pd_ci.PSMwithGPM = pd_ci,
+          os.PSMwithGPM = os,
+          os_ci.PSMwithGPM = os_ci)
+      
+des <- des %>%
+   rename(
+          pfs.MSMwithGPM = pfs_b,
+          pfs_ci.MSMwithGPM = pfs_ci_b,
+          pd.MSMwithGPM = pd_b,
+          pd_ci.MSMwithGPM = pd_ci_b,
+          os.MSMwithGPM = os_b,
+          os_ci.MSMwithGPM = os_ci_b,
+          pfs.PartlyNaiveMSM = pfs,
+          pfs_ci.PartlyNaiveMSM = pfs_ci,
+          pd.PartlyNaiveMSM = pd,
+          pd_ci.PartlyNaiveMSM = pd_ci,
+          os.PartlyNaiveMSM = os,
+          os_ci.PartlyNaiveMSM = os_ci)   
+
+results <- merge(part, des, by = c("s_size", "prop_e", "rep")) %>% 
+   select("rep", "s_size", "prop_e",
+        ends_with("PSMwithGPM"),
+        ends_with("NaivePSM"),
+        ends_with("PartlyNaiveMSM"),
+        ends_with("MSMwithGPM"))
+
+
+
+results2 <- results %>%   
+            pivot_longer(cols = !c("rep", "s_size", "prop_e"),
+               names_to = c('.value','method'), 
+               names_sep = "\\.")
+
+
+count_failed <- results2 %>%
+  group_by(method) %>% 
+        mutate(flag_error = ifelse(is.na(pfs), 1, 0)
+               #prop_os = os_events/s_size
+               ) %>% 
+        group_by(method, s_size, prop_e) %>% 
+        summarize(count = sum(flag_error),
+                  percent = count/n(),
+                  .groups = "keep")
+
+count_failed <- as.data.frame(count_failed)
+
+write_csv(count_failed, file = paste0(filepath, "/ChapterTwo/tables/failed_final2_", scen,".csv"))
+
+          p1 <- ggplot(count_failed, aes(x = prop_e,
+                             y = percent,
+                             group = s_size,
+                             color = as.factor(s_size))) +
+            geom_line() +
+            labs(title = c(paste0("Scenario ", scen, ": Proportion of repetitions that fail to fit curve for at least one hazard")),
+                 color = "Sample size",
+                 x = "Proportion of PFS events",
+                 y = "Proportion of repetitions ") +
+            scale_x_continuous(breaks = seq(0, 1, 0.2)) +
+            ylim(c(0, 1)) +
+            facet_wrap(~method) +
+            theme_classic()
+    p1
+    ggsave(file = paste0(filepath, "/ChapterTwo/figures/plotcount_failed_final2_", scen, ".", filetype),
+           p1, width = 10, height = 7, units = "in", dpi = 300)
+
+count_wide <- count_failed %>% 
+  select(-count) %>% 
+  pivot_wider(names_from = method, values_from = percent)
+
+count_failed1 <-count_failed %>% 
+        filter(method %in% c("MSMwithGPM", "PSMwithGPM")) %>% 
+        mutate(method1 = ifelse(method == "MSMwithGPM", "MSM", "PSM"))
+
+p1 <- ggplot(count_failed1, aes(fill = method1,
+                                x=prop_e,
+                                y = percent)) +
+  geom_bar(stat = "identity", position = "dodge") +
+  facet_grid(~ s_size, switch = "x") +
+  theme(strip.placement = "outside",
+        strip.background = element_rect(fill = NA, color = "white"),
+        panel.spacing = unit(-.01,"cm"))+
+            labs(title = c(paste0("Scenario ", scen, ": Proportion of repetitions that fail to fit curve for at least one hazard")),
+                 x = "Proportion of PFS events",
+                 y = "Proportion of repetitions",
+                 fill = "Method") +
+  theme_classic() +
+  scale_fill_manual(values = c("#6b6b6b", "#d2d2d2")) +
+   theme(legend.position = c(0.95, 0.6))
+
+p1
+
+ggsave(file = paste0(filepath, "/ChapterTwo/figures/plotcount_failed_final2_bar", scen, ".", filetype),
+           p1, width = 8, height = 3, units = "in", dpi = 300)
+
+
+unnested <- results2 %>%
+   group_by(method) %>% 
+        rowwise() %>%
+        mutate(
+               cover_pfs = ifelse(is_na(pfs_ci), NA, ifelse((pfs_ci[[1]]< surv$rmeanpfs &
+                                  surv$rmeanpfs < pfs_ci[[2]]), 1, 0)),
+               cover_pd = ifelse(is_na(pd_ci),NA, ifelse((pd_ci[[1]] < surv$rmeanpd &
+                                  surv$rmeanpd < pd_ci[[2]]), 1, 0)),
+               cover_os = ifelse(is_na(os_ci),NA, ifelse((os_ci[[1]] < surv$rmeanos &
+                                  surv$rmeanos < os_ci[[2]]), 1, 0)),
+               e_pfs = ae(surv$rmeanpfs, pfs),
+               e_pd = ae(surv$rmeanpd, pd),
+               e_os = ae(surv$rmeanos, os),
+               pe_pfs = ape(surv$rmeanpfs, pfs),
+               pe_pd = ape(surv$rmeanpd, pd),
+               pe_os = ape(surv$rmeanos, os),
+               prop20_pfs = ifelse(e_pfs/surv$rmeanpfs > 0.2, 1, 0),
+               prop20_pd = ifelse(e_pd/surv$rmeanpd > 0.2, 1, 0),
+               prop20_os = ifelse(e_os/surv$rmeanos > 0.2, 1, 0)
+               # propcurve_pfs = ifelse(pfs_dist == part$pfs_curve, 1, 0),
+               # propcurve_os = ifelse(os_dist == part$os_curve, 1, 0),
+               # prop_e_os = os_events/s_size,
+               # prop_obs_pfs = pfs_obs/pfs,
+               # prop_obs_pd = pd_obs/pd,
+               # prop_obs_os = os_obs/os,
+               # width_pfs = pfs_ci[[2]] - pfs_ci[[1]],
+               # width_pd = pd_ci[[2]] - pd_ci[[1]],
+               # width_os = os_ci[[2]] - os_ci[[1]]
+              # prop_os = os_events/s_size
+               )
+      
+      
+results_sum <- unnested %>% 
+        group_by(method, s_size, prop_e) %>% 
+        summarise(
+          across(starts_with("cover"), mean,na.rm = TRUE), 
+          across(starts_with("e"), list(ma = mean), .names="{fn}{col}",na.rm = TRUE), 
+          across(starts_with("pe"), list(ma = mean), .names="{fn}{col}",na.rm = TRUE),
+          se_mae_pfs = se(pfs),
+          se_mae_pd = se(pd),
+          se_mae_os = se(os),
+          se_mape_pfs = se(pfs)/surv$rmeanpfs,
+          se_mape_pd = se(pd)/surv$rmeanpd,
+          se_mape_os = se(os)/surv$rmeanos,
+          across(starts_with("prop20"), mean, na.rm = TRUE), 
+          across(starts_with("propcurve"), mean),
+          across(starts_with("prop_e_"), mean),
+          across(starts_with("prop_obs"), mean),
+                          .groups = "keep") %>% 
+        ungroup()
+      
+      # Create long data for faceted plots 
+      results_fin <- results_sum %>% 
+          pivot_longer(c(starts_with("mae"), 
+                         starts_with("mape"),
+                         starts_with("se_mae"),
+                         starts_with("se_mape"),
+                         starts_with("cover"),
+                         starts_with("prop20"),
+                         starts_with("prop_obs")),
+                       names_to = c(".value", "category"),
+                       names_pattern = "(.+)_(.+)")
+      
+ 
+      
+      
+# Keeping only common reps
+results <- results %>%
+  filter(!is.na(pfs.PSMwithGPM)) %>%
+  filter(!is.na(pfs.NaivePSM)) %>%
+  filter(!is.na(pfs.PartlyNaiveMSM)) %>%
+  filter(!is.na(pfs.MSMwithGPM))
+
+results2 <- results %>%
+            pivot_longer(cols = !c("rep", "s_size", "prop_e"),
+               names_to = c('.value','method'),
+               names_sep = "\\.")
+      
+   
+unnested <- results2 %>%
+ group_by(method) %>%
+      rowwise() %>%
+      mutate(
+             cover_pfs = ifelse((pfs_ci[[1]]< surv$rmeanpfs &
+                                surv$rmeanpfs < pfs_ci[[2]]), 1, 0),
+             cover_pd = ifelse((pd_ci[[1]] < surv$rmeanpd &
+                                surv$rmeanpd < pd_ci[[2]]), 1, 0),
+             cover_os = ifelse((os_ci[[1]] < surv$rmeanos &
+                                surv$rmeanos < os_ci[[2]]), 1, 0),
+             e_pfs = ae(surv$rmeanpfs, pfs),
+             e_pd = ae(surv$rmeanpd, pd),
+             e_os = ae(surv$rmeanos, os),
+             pe_pfs = ape(surv$rmeanpfs, pfs),
+             pe_pd = ape(surv$rmeanpd, pd),
+             pe_os = ape(surv$rmeanos, os),
+             prop20_pfs = ifelse(e_pfs/surv$rmeanpfs > 0.2, 1, 0),
+             prop20_pd = ifelse(e_pd/surv$rmeanpd > 0.2, 1, 0),
+             prop20_os = ifelse(e_os/surv$rmeanos > 0.2, 1, 0)
+             # propcurve_pfs = ifelse(pfs_dist == part$pfs_curve, 1, 0),
+             # propcurve_os = ifelse(os_dist == part$os_curve, 1, 0),
+             # prop_e_os = os_events/s_size,
+             # prop_obs_pfs = pfs_obs/pfs,
+             # prop_obs_pd = pd_obs/pd,
+             # prop_obs_os = os_obs/os,
+             # width_pfs = pfs_ci[[2]] - pfs_ci[[1]],
+             # width_pd = pd_ci[[2]] - pd_ci[[1]],
+             # width_os = os_ci[[2]] - os_ci[[1]]
+            # prop_os = os_events/s_size
+             )
+
+    results_sum <- unnested %>%
+      group_by(method, s_size, prop_e) %>%
+      summarise(
+        across(starts_with("cover"), mean,na.rm = TRUE),
+        across(starts_with("e"), list(ma = mean), .names="{fn}{col}",na.rm = TRUE),
+        across(starts_with("pe"), list(ma = mean), .names="{fn}{col}",na.rm = TRUE),
+        se_mae_pfs = se(pfs),
+        se_mae_pd = se(pd),
+        se_mae_os = se(os),
+        se_mape_pfs = se(pfs)/surv$rmeanpfs,
+        se_mape_pd = se(pd)/surv$rmeanpd,
+        se_mape_os = se(os)/surv$rmeanos,
+        across(starts_with("prop20"), mean, na.rm = TRUE),
+        across(starts_with("propcurve"), mean),
+        across(starts_with("prop_e_"), mean),
+        across(starts_with("prop_obs"), mean),
+                        .groups = "keep") %>%
+      ungroup()
+
+    # Create long data for faceted plots
+    results_fin <- results_sum %>%
+        pivot_longer(c(starts_with("mae"),
+                       starts_with("mape"),
+                       starts_with("se_mae"),
+                       starts_with("se_mape"),
+                       starts_with("cover"),
+                       starts_with("prop20"),
+                       starts_with("prop_obs")),
+                     names_to = c(".value", "category"),
+                     names_pattern = "(.+)_(.+)")
+    
+# Calculate rmse and its se
+
+pop_row <- as.data.frame(cbind(pop_pfs = surv$rmeanpfs, pop_pd = surv$rmeanpd, pop_os = surv$rmeanos))
+pop_row <- as.data.frame(lapply(pop_row, rep, times = nrow(unnested)))
+
+meas <- c("pfs", "pd", "os")
+
+resultsrmse <- ldply(seq_along(meas),function(i) {
+  unnested %>%
+    cbind(pop_row) %>%
+    group_by(method, s_size, prop_e) %>%
+    do(calc_absolute(.,
+                     estimates = paste0(meas[[i]]),
+                     true_param = paste0("pop_", meas[[i]]),
+                     perfm_criteria = c("bias","rmse")))  %>%
+    cbind(., param = meas[[i]])
+})
+
+ resultsrmse <- resultsrmse %>%
+   pivot_wider(names_from = param, values_from = c(bias, bias_mcse, rmse, rmse_mcse))
+
+resultsrmse2 <- resultsrmse %>%
+  pivot_longer(c(starts_with("rmse"),
+                 starts_with("bias"),
+               starts_with("rmse_mcse"),
+               starts_with("bias_mcse")),
+               names_to = c(".value", "category"),
+               names_pattern = "(.+)_(.+)")
+
+
+
+
+results_fin <- full_join(results_fin, resultsrmse2)
+      
+write_csv(as.data.frame(results_fin), file = paste0(filepath, "/ChapterTwo/tables/results-final2", "group", scen, type,".csv"))
+      
+```
+
+## Plot results
+```{r Plot results new, echo=FALSE, results="hide"}
+
+#plotting
+# results_fin<-read_csv(file = paste0(filepath, "/ChapterTwo/tables/results-final2", "group", scen, type,".csv"))
+      
+            
+#Calculate proportion performing best
+      
+results_wide <- unnested %>% 
+  group_by(rep, s_size, prop_e) %>% 
+  select(rep, s_size, prop_e, method, e_os) %>% 
+  filter(e_os == min(e_os))
+
+
+count <- results_wide %>% 
+  group_by(s_size, prop_e) %>% 
+  count(method) %>% 
+  mutate(percent = round( n / sum(n) * 100, 2)) %>% 
+  ungroup()
+
+count_wide <- count %>% 
+  select(-n) %>% 
+  pivot_wider(names_from = method, values_from= percent)
+write_csv(as.data.frame(count_wide), file = paste0(filepath, "/ChapterTwo/tables/results-which_best", scen, type,".csv"))
+
+count2 <- results_wide %>% 
+  mutate(method2= ifelse(method %in% c("MSMwithGPM", "PartlyNaiveMSM"), "MSM", "PSM")) %>% 
+  select(-method) %>% 
+  group_by(s_size, prop_e) %>% 
+  count(method2) %>% 
+  mutate(percent = round( n / sum(n) * 100, 2)) %>% 
+  ungroup() 
+
+count_wide2 <- count2 %>% 
+  select(-n) %>% 
+  pivot_wider(names_from = method2, values_from= percent)
+write_csv(as.data.frame(count_wide2), file = paste0(filepath, "/ChapterTwo/tables/results-which_best2", scen, type,".csv"))
+
+
+p1 <- ggplot(count2, aes(x = prop_e,
+                        y = percent,
+                        fill = method2,
+                        group = s_size)) +
+     geom_bar(position="stack", stat="identity") +
+     facet_wrap(~s_size)
+p1
+
+    ggsave(file = paste0(filepath, "/ChapterTwo/figures/plot_which_best2", scen, type, ".", filetype),
+           p1, width = 10, height = 7, units = "in", dpi = 300)
+
+
+ ## Final in paper
+
+results_summary1 <- results_fin %>%
+  mutate(Outcome = category) %>% 
+  select(method, s_size, prop_e, Outcome, mae)
+results_summary2 <- results_summary1 %>%
+#  filter(!method == "PartlyNaiveMSM") %>% 
+  tidyr::pivot_wider(names_from = method, values_from = mae)
+
+
+p = nested_loop_plot(resdf = results_summary2,
+                     x = "prop_e", steps = c("s_size"),
+ #                    x = "prop_e", steps = c("s_size", "scenario"),                     
+                     grid_rows = "Outcome",
+                     grid_scales = "fixed",
+                     steps_names_annotate = TRUE,
+                     steps_values_annotate = TRUE,
+                      steps_annotation_size = 1.5,
+                      steps_y_base = -.1,
+                      steps_y_height = .05,
+                      steps_y_shift = .5,
+                     x_name = "Proportion of PFS events observed (%)",
+                     y_name = "Mean absolute error (MAE)",
+                    # x_labels = c(0.5, 1),
+                     hline_intercept = 0,
+                     y_expand_add = c(.2, NULL),
+                    colors = c("#000000", "#6b6b6b", "#d2d2d2","#919191"),
+                     line_linetypes = c("dashed","solid","longdash","dotted" ),
+                     point_size = 0,
+                     spu_x_shift = 0.3,
+                     replace_labels = list(
+                      prop_e = c("0.3" = "", "0.4" = "40", "0.5" = "", "0.6" = "60", "0.7" = "", "0.8" = "80", "0.9" = "", "1" = "100"),
+                      Outcome = c("pfs" = "PF", "pd" = "PD", "os" = "OS")), 
+                     post_processing = list(
+                      add_custom_theme = list(
+                      axis.text.x = element_text(angle = 0,
+                      vjust = 0.5,
+                      size = 6)),
+                      add_custom_theme = list(legend.position = "bottom",
+                                              legend.text = element_text(size=10))
+                     )
+)        
+print(p)
+ggsave(file = paste0(filepath, "/ChapterTwo/figures/plot_mae_final2", scen, type, ".", filetype),
+       p, width = 10, height = 5, units = "in", dpi = 300, device = filetype)
+
+
+
+#Mape
+results_summary1 <- results_fin %>%
+  mutate(Outcome = category) %>% 
+  select(method, s_size, prop_e, Outcome, mape)
+results_summary2 <- results_summary1 %>%
+#  filter(!method == "PartlyNaiveMSM") %>% 
+  tidyr::pivot_wider(names_from = method, values_from = mape)
+
+p = nested_loop_plot(resdf = results_summary2,
+                     x = "prop_e", steps = c("s_size"),
+                     grid_rows = "Outcome",
+                     grid_scales = "fixed",
+                     steps_names_annotate = TRUE,
+                     steps_values_annotate = TRUE,
+                      steps_annotation_size = 3,
+                      steps_y_base = -.15,
+                      steps_y_height = .04,
+                      steps_y_shift = .15,
+                     x_name = "Proportion of PFS events observed (%)",
+                     y_name = "Mean absolute percentage error (MAPE)",
+                    # x_labels = c(0.5, 1),
+                     hline_intercept = 0,
+                     y_expand_add = c(.2, NULL),
+                    colors = c("#000000", "#6b6b6b", "#d2d2d2","#919191"),
+                     line_linetypes = c("dashed","solid","longdash","dotted" ),
+                     point_size = 0,
+                     spu_x_shift = 0.3,
+                     replace_labels = list(
+                      prop_e = c("0.3" = "", "0.4" = "40", "0.5" = "", "0.6" = "60", "0.7" = "", "0.8" = "80", "0.9" = "", "1" = "100"),
+                      Outcome = c("pfs" = "PF", "pd" = "PD", "os" = "OS")), 
+                     post_processing = list(
+                      add_custom_theme = list(
+                      axis.text.x = element_text(angle = 0,
+                      vjust = 0.5,
+                      size = 4)),
+                      add_custom_theme = list(legend.position = "bottom",
+                                              legend.text = element_text(size=12))
+                     )
+)        
+print(p)
+ggsave(file = paste0(filepath, "/ChapterTwo/figures/plot_mape_final2", scen, type, ".", filetype),
+       p,  width = 10, height = 6.5, units = "in", dpi = 300, device = filetype)
+
+
+
+## coverage
+
+results_summary1 <- results_fin %>%
+  mutate(Outcome = category) %>% 
+  select(method, s_size, prop_e, Outcome, cover)
+results_summary2 <- results_summary1 %>%
+  tidyr::pivot_wider(names_from = method, values_from = cover)
+
+head(results_summary2)
+p = nested_loop_plot(resdf = results_summary2,
+                    x = "prop_e", steps = c("s_size"),
+                    grid_rows = "Outcome",
+                    grid_scales = "fixed",
+                     steps_names_annotate = TRUE,
+                     steps_values_annotate = TRUE,
+                     steps_annotation_size = 3,
+                     steps_y_base = -.1,
+                     steps_y_height = .02,
+                     steps_y_shift = .1,
+                     x_name = "Proportion of PFS events observed (%)",
+                     y_name = "Coverage",
+                     hline_intercept = 0.95,
+                     colors = c("#000000", "#6b6b6b", "#d2d2d2","#919191"),
+                     line_linetypes = c("dashed","solid","longdash","dotted" ),
+                     point_size = 0,
+                     spu_x_shift = 0.3,
+                     replace_labels = list(
+                      prop_e = c("0.3" = "", "0.4" = "40", "0.5" = "", "0.6" = "60", "0.7" = "", "0.8" = "80", "0.9" = "", "1" = "100"),
+                      Outcome = c("pfs" = "PF", "pd" = "PD", "os" = "OS")), 
+                     post_processing = list(
+                      add_custom_theme = list(
+                      axis.text.x = element_text(angle = 0,
+                      vjust = 0.5,
+                      size = 4)),
+                      add_custom_theme = list(legend.position = "right",
+                                              legend.text = element_text(size=8))
+                     )
+)                     
+print(p)
+ggsave(file = paste0(filepath, "/ChapterTwo/figures/plot_cover_final2", scen, type, ".", filetype),
+       p,  width = 12, height = 7, units = "in", dpi = 300, device = filetype)
+
+
+
+
+
+```
+
+The performance measures were summarized and plotted to illustrate the impact across sample sizes and degrees of censoring with true distribution correctly specified.
+
+```{r plot grouped results new, echo=FALSE, results="hide"}
+
+type <- "aicc"
+
+summary <- lapply(seq_along(1:scens), function(j){
+     read.csv(file = paste0(filepath, "/ChapterTwo/tables/results-final2group", j, type,".csv"))
+     })
+
+names(summary) <- seq_along(1:scens)
+results_summary <- dplyr::bind_rows(summary, .id = "scenario")
+
+
+## Final in paper
+results_summary1 <- results_summary %>%
+  mutate(Outcome = category) %>% 
+  filter(scenario == scen) %>% 
+  select(method, s_size, prop_e, Outcome, mae)
+  #select(scenario, method, s_size, prop_e, Outcome, mae)
+
+results_summary2 <- results_summary1 %>%
+ # filter(!method == "PartlyNaiveMSM") %>% 
+  tidyr::pivot_wider(names_from = method, values_from = mae)
+
+p = nested_loop_plot(resdf = results_summary2,
+                     x = "prop_e", steps = c("s_size"),
+ #                    x = "prop_e", steps = c("s_size", "scenario"),                     
+                     grid_rows = "Outcome",
+                     grid_scales = "fixed",
+                     steps_names_annotate = TRUE,
+                     steps_values_annotate = TRUE,
+                      steps_annotation_size = 1.5,
+                      steps_y_base = -.1,
+                      steps_y_height = .05,
+                      steps_y_shift = .5,
+                     x_name = "Proportion of PFS events observed (%)",
+                     y_name = "Mean absolute error (MAE)",
+                    # x_labels = c(0.5, 1),
+                     hline_intercept = 0,
+                     y_expand_add = c(.2, NULL),
+                    colors = c("#000000", "#6b6b6b", "#d2d2d2","#919191"),
+                     line_linetypes = c("dashed","solid","longdash","dotted" ),
+                     point_size = 0,
+                     spu_x_shift = 0.3,
+                     replace_labels = list(
+                      prop_e = c("0.3" = "", "0.4" = "40", "0.5" = "", "0.6" = "60", "0.7" = "", "0.8" = "80", "0.9" = "", "1" = "100"),
+                      Outcome = c("pfs" = "PF", "pd" = "PD", "os" = "OS")), 
+                     post_processing = list(
+                      add_custom_theme = list(
+                      axis.text.x = element_text(angle = 0,
+                      vjust = 0.5,
+                      size = 6)),
+                      add_custom_theme = list(legend.position = "right",
+                                              legend.text = element_text(size=8))
+                     )
+)        
+print(p)
+ggsave(file = paste0(filepath, "/ChapterTwo/figures/plot_mae_final2", scen, type, ".", filetype),
+       p, width = 10, height = 5, units = "in", dpi = 300, device = filetype)
+
+
+
+#Mape
+results_summary1 <- results_summary %>%
+  mutate(Outcome = category) %>% 
+  select(scenario, method, s_size, prop_e, Outcome, mape)
+results_summary2 <- results_summary1 %>%
+  #filter(!method == "PartlyNaiveMSM") %>% 
+  tidyr::pivot_wider(names_from = method, values_from = mape)
+
+p = nested_loop_plot(resdf = results_summary2,
+                     x = "prop_e", steps = c("s_size", "scenario"),
+                     grid_rows = "Outcome",
+                     grid_scales = "fixed",
+                     steps_names_annotate = TRUE,
+                     steps_values_annotate = TRUE,
+                      steps_annotation_size = 3,
+                      steps_y_base = -.15,
+                      steps_y_height = .04,
+                      steps_y_shift = .15,
+                     x_name = "Proportion of PFS events observed (%)",
+                     y_name = "Mean absolute percentage error (MAPE)",
+                    # x_labels = c(0.5, 1),
+                     hline_intercept = 0,
+                     y_expand_add = c(.2, NULL),
+                    colors = c("#000000", "#6b6b6b", "#d2d2d2","#919191"),
+                     line_linetypes = c("dashed","solid","longdash","dotted" ),
+                     point_size = 0,
+                     spu_x_shift = 0.3,
+                     replace_labels = list(
+                      prop_e = c("0.3" = "", "0.4" = "40", "0.5" = "", "0.6" = "60", "0.7" = "", "0.8" = "80", "0.9" = "", "1" = "100"),
+                      Outcome = c("pfs" = "PF", "pd" = "PD", "os" = "OS")), 
+                     post_processing = list(
+                      add_custom_theme = list(
+                      axis.text.x = element_text(angle = 0,
+                      vjust = 0.5,
+                      size = 4)),
+                      add_custom_theme = list(legend.position = "right",
+                                              legend.text = element_text(size=8))
+                     )
+)        
+print(p)
+ggsave(file = paste0(filepath, "/ChapterTwo/figures/plot_mape_final2", type, ".", filetype),
+       p,  width = 18, height = 10, units = "in", dpi = 300, device = filetype)
+
+
+# Coverage figure
+
+
+results_summary1 <- results_summary %>%
+  mutate(Outcome = category) %>% 
+  select(scenario, method, s_size, prop_e, Outcome, cover)
+results_summary2 <- results_summary1 %>%
+  tidyr::pivot_wider(names_from = method, values_from = cover)
+head(results_summary2)
+p = nested_loop_plot(resdf = results_summary2,
+#                    x = "prop_e", steps = c("s_size"),
+                    x = "prop_e", steps = c("s_size", "scenario"),
+                    grid_rows = "Outcome",
+                     grid_scales = "fixed",
+                     steps_names_annotate = TRUE,
+                     steps_values_annotate = TRUE,
+                     steps_annotation_size = 3,
+                     steps_y_base = -.1,
+                     steps_y_height = .02,
+                     steps_y_shift = .1,
+                     x_name = "Proportion of PFS events observed (%)",
+                     y_name = "Coverage",
+                     hline_intercept = 0.95,
+                     colors = c("#000000", "#6b6b6b", "#d2d2d2","#919191"),
+                     line_linetypes = c("dashed","solid","longdash","dotted" ),
+                     point_size = 0,     
+                     spu_x_shift = 0.3,
+                     replace_labels = list(
+                      prop_e = c("0.3" = "", "0.4" = "40", "0.5" = "", "0.6" = "60", "0.7" = "", 
+                                 "0.8" = "80", "0.9" = "", "1" = "100"),
+                      Outcome = c("pfs" = "PF", "pd" = "PD", "os" = "OS")), 
+                     post_processing = list(
+                      add_custom_theme = list(
+                      axis.text.x = element_text(angle = 0,
+                      vjust = 0.5,
+                      size = 4),
+                      legend.position = "right",
+                      legend.text = element_text(size=8)
+                      )
+                     )
+)                     
+print(p)
+ggsave(file = paste0(filepath, "/ChapterTwo/figures/plot_cover_final2", type, ".", filetype),
+       p, width = 13, height = 9, units = "in", dpi = 300)
+
+
+
+```
+
+
+
