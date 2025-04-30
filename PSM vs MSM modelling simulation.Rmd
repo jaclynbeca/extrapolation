@@ -1,5 +1,5 @@
 ---
-title: "Thesis Chapter 2"
+title: "PSm vs MSM modelling simulation study"
 author: "Jaclyn Beca"
 date: "`r Sys.Date()`"
 output:
