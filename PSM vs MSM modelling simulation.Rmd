@@ -1,5 +1,5 @@
 ---
-title: "PSm vs MSM modelling simulation study"
+title: "PSM vs MSM modelling simulation study"
 author: "Jaclyn Beca"
 date: "`r Sys.Date()`"
 output:
@@ -34,7 +34,7 @@ source("PSM_MSM_sim_functions.R")
 
 # Introduction
 
-This code is used to produce the results for thesis Chapter 2, and the paper "Impact of limited sample size and follow-up on survival extrapolation of multiple events for health technology assessment: A simulation study"
+This code is used to produce the results for thesis Chapter 2, and the paper "Impact of limited sample size and follow-up on partitioned survival and multistate modelling-based health economic models: A simulation study"
 Built using R version 4.3.1.
 
 # Methods
